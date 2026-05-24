@@ -1,0 +1,43 @@
+# ── Python ────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# ── Virtual environment ───────────────────────────────────
+venv/
+.venv/
+env/
+
+# ── Logs ─────────────────────────────────────────────────
+logs/
+*.log
+
+# ── MT5 compiled files ────────────────────────────────────
+*.ex5
+*.ex4
+
+# ── Bridge files (runtime, not source) ───────────────────
+trader_objects.txt
+trader_commands.txt
+trader_commands_done.txt
+
+# ── Backtest results ──────────────────────────────────────
+backtest_results.json
+reports/
+
+# ── Credentials — NEVER commit these ─────────────────────
+.env
+secrets.py
+
+# ── OS files ─────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── IDE ───────────────────────────────────────────────────
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
