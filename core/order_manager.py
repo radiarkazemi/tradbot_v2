@@ -23,12 +23,14 @@ ORDER LOGIC:
     MT5 requires minimum stop distance. We fetch the symbol's STOPLEVEL
     and ensure SL is at least that far from entry.
 """
-import sys, os as _os
-sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
-
-import logging
-import MetaTrader5 as mt5
 from config import LOT_SIZE, TP_RR_RATIO, MAGIC_NUMBER
+import MetaTrader5 as mt5
+import logging
+import sys
+import os as _os
+sys.path.insert(0, _os.path.dirname(
+    _os.path.dirname(_os.path.abspath(__file__))))
+
 
 log = logging.getLogger("orders")
 
@@ -40,9 +42,12 @@ def _filling_mode(symbol: str) -> int:
     if info is None:
         return mt5.ORDER_FILLING_RETURN
     m = info.filling_mode
-    if m & 4: return mt5.ORDER_FILLING_RETURN
-    if m & 2: return mt5.ORDER_FILLING_IOC
-    if m & 1: return mt5.ORDER_FILLING_FOK
+    if m & 4:
+        return mt5.ORDER_FILLING_RETURN
+    if m & 2:
+        return mt5.ORDER_FILLING_IOC
+    if m & 1:
+        return mt5.ORDER_FILLING_FOK
     return mt5.ORDER_FILLING_RETURN
 
 
@@ -104,28 +109,32 @@ def build_level_orders(source_price: float, pip_size: float,
     Returns list of order parameter dicts.
     """
     step = pip_step * pip_size
-    above = [_round_price(source_price + step * i, symbol) for i in range(1, 4)]
-    below = [_round_price(source_price - step * i, symbol) for i in range(1, 4)]
+    above = [_round_price(source_price + step * i, symbol)
+             for i in range(1, 4)]
+    below = [_round_price(source_price - step * i, symbol)
+             for i in range(1, 4)]
 
     min_dist = _min_stop_distance(symbol)
     orders = []
     for i in range(3):
         lvl = i + 1
-        ea  = above[i]
-        es  = below[i]
+        ea = above[i]
+        es = below[i]
 
         # SL = mirror level. If distance < min_stop, push SL further out.
         # Keep entry fixed — only adjust SL (and TP proportionally).
-        sl_buy_raw  = es   # mirror: buy SL = below level
+        sl_buy_raw = es   # mirror: buy SL = below level
         sl_sell_raw = ea   # mirror: sell SL = above level
 
-        sl_buy  = _adjust_sl(ea, sl_buy_raw,  symbol, True)
+        sl_buy = _adjust_sl(ea, sl_buy_raw,  symbol, True)
         sl_sell = _adjust_sl(es, sl_sell_raw, symbol, False)
 
         dist_b = ea - sl_buy
         dist_s = sl_sell - es
-        tp_buy  = _adjust_tp(ea, _round_price(ea + dist_b * TP_RR_RATIO, symbol), symbol, True)
-        tp_sell = _adjust_tp(es, _round_price(es - dist_s * TP_RR_RATIO, symbol), symbol, False)
+        tp_buy = _adjust_tp(ea, _round_price(
+            ea + dist_b * TP_RR_RATIO, symbol), symbol, True)
+        tp_sell = _adjust_tp(es, _round_price(
+            es - dist_s * TP_RR_RATIO, symbol), symbol, False)
 
         orders.append({
             "level":      lvl,
@@ -150,10 +159,11 @@ def build_level_orders(source_price: float, pip_size: float,
     return orders
 
 
-def send_orders(orders: list, symbol: str) -> list:
+def send_orders(orders: list, symbol: str, lot_size: float = None) -> list:
     """Send order dicts to MT5. Returns results list."""
     filling = _filling_mode(symbol)
     results = []
+    vol = lot_size if lot_size and lot_size > 0 else LOT_SIZE
 
     for o in orders:
         is_buy = o["type"] == "BUY_STOP"
@@ -164,7 +174,7 @@ def send_orders(orders: list, symbol: str) -> list:
         request = {
             "action":       mt5.TRADE_ACTION_PENDING,
             "symbol":       symbol,
-            "volume":       LOT_SIZE,
+            "volume":       vol,
             "type":         order_type,
             "price":        o["entry"],
             "sl":           o["sl"],
@@ -207,11 +217,12 @@ def send_orders(orders: list, symbol: str) -> list:
 def place_level_orders(source_price: float, pip_size: float,
                        pip_step: float, symbol: str,
                        generation: int = 0,
-                       tp_pips: float = 0.0) -> list:
+                       tp_pips: float = 0.0,
+                       lot_size: float = None) -> list:
     """Build + send 6 orders for a source line. Returns results."""
     orders = build_level_orders(source_price, pip_size, pip_step,
                                 symbol, generation, tp_pips=tp_pips)
-    return send_orders(orders, symbol)
+    return send_orders(orders, symbol, lot_size=lot_size)
 
 
 def cancel_all_tb_orders(symbol: str) -> int:
