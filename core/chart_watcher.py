@@ -129,7 +129,7 @@ def parse_objects_file(path: str, filter_symbol: str = None) -> tuple:
             lines = f.readlines()
     except Exception as e:
         log.warning("Could not read file: %s", e)
-        return [], [], None
+        return [], [], None, {}
 
     # Read file symbol from header
     file_symbol = None
@@ -175,9 +175,21 @@ def parse_objects_file(path: str, filter_symbol: str = None) -> tuple:
         except Exception as e:
             log.debug("Skipping line: %s — %s", line[:60], e)
 
-    log.debug("Parsed file: %d trader objects, %d auto (EA on %s)",
-              len(trader_objects), len(auto_objects), file_symbol)
-    return trader_objects, auto_objects, file_symbol
+    # Parse candle data from header
+    candle = {}
+    for line in lines:
+        for key in ("CANDLE_O","CANDLE_H","CANDLE_L","CANDLE_C","BID","CANDLE_T",
+                        "PREV_H","PREV_L","PREV_C","PREV_O","PREV_T"):
+            if line.startswith(key + ":"):
+                try:
+                        val = line.strip().split(":",1)[1]
+                        candle[key] = int(val) if key in ("CANDLE_T","PREV_T") else float(val)
+                except: pass
+
+    log.debug("Parsed: %d trader objects, %d auto | EA=%s | H=%.5f L=%.5f",
+              len(trader_objects), len(auto_objects), file_symbol,
+              candle.get("CANDLE_H", 0), candle.get("CANDLE_L", 0))
+    return trader_objects, auto_objects, file_symbol, candle
 
 
 def connect_mt5() -> bool:

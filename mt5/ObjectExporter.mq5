@@ -68,6 +68,32 @@ void ExportObjects()
    string lines = "";
    lines += "SYMBOL:" + Symbol() + "\n";
    lines += "TS:"     + IntegerToString((int)TimeCurrent()) + "\n";
+   // Export current candle OHLC so Python can detect line touches
+   double candle_open  = iOpen(Symbol(),  PERIOD_CURRENT, 0);
+   double candle_high  = iHigh(Symbol(),  PERIOD_CURRENT, 0);
+   double candle_low   = iLow(Symbol(),   PERIOD_CURRENT, 0);
+   double candle_close = iClose(Symbol(), PERIOD_CURRENT, 0);
+   double bid          = SymbolInfoDouble(Symbol(), SYMBOL_BID);
+   lines += "CANDLE_O:" + DoubleToString(candle_open,  _Digits) + "\n";
+   lines += "CANDLE_H:" + DoubleToString(candle_high,  _Digits) + "\n";
+   lines += "CANDLE_L:" + DoubleToString(candle_low,   _Digits) + "\n";
+   lines += "CANDLE_C:" + DoubleToString(candle_close, _Digits) + "\n";
+   lines += "BID:"      + DoubleToString(bid,           _Digits) + "\n";
+   // Current forming candle time (bar 0) — used to detect same-candle draws
+   datetime candle_time = iTime(Symbol(), PERIOD_CURRENT, 0);
+   lines += "CANDLE_T:" + IntegerToString((int)candle_time) + "\n";
+   // Previous CLOSED candle (bar 1) — used for activation detection
+   // Only a completed candle can truly confirm a touch
+   double prev_high  = iHigh(Symbol(),  PERIOD_CURRENT, 1);
+   double prev_low   = iLow(Symbol(),   PERIOD_CURRENT, 1);
+   double prev_close = iClose(Symbol(), PERIOD_CURRENT, 1);
+   double prev_open  = iOpen(Symbol(),  PERIOD_CURRENT, 1);
+   datetime prev_time = iTime(Symbol(), PERIOD_CURRENT, 1);
+   lines += "PREV_H:"  + DoubleToString(prev_high,  _Digits) + "\n";
+   lines += "PREV_L:"  + DoubleToString(prev_low,   _Digits) + "\n";
+   lines += "PREV_C:"  + DoubleToString(prev_close, _Digits) + "\n";
+   lines += "PREV_O:"  + DoubleToString(prev_open,  _Digits) + "\n";
+   lines += "PREV_T:"  + IntegerToString((int)prev_time)     + "\n";
    lines += "COUNT:"  + IntegerToString(total) + "\n";
 
    for(int i = 0; i < total; i++)

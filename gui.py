@@ -109,7 +109,8 @@ class Sig(QObject):
 
 
 class WatcherWorker(threading.Thread):
-    def __init__(self, sig: Sig, pip_step: float, symbol: str = WATCH_SYMBOL):
+    def __init__(self, sig: Sig, pip_step: float, symbol: str = WATCH_SYMBOL,
+                 tp_pips: float = 0.0, spawn_on: str = "L2 and L3"):
         super().__init__(daemon=True)
         self.sig       = sig
         self.pip_step  = pip_step
@@ -118,6 +119,12 @@ class WatcherWorker(threading.Thread):
         self.prev_names: set  = set()
         self.drawn:     dict  = {}
         self.follow_enabled: bool = True
+        self.tp_pips      = tp_pips    # 0 = RR ratio, >0 = fixed pip TP from L3
+        self.spawn_on     = spawn_on   # "L2 only" / "L3 only" / "L2 and L3"
+        self.orders_placed: set  = set()
+        # Phase 3: track pending orders by ticket → {level, gen, src, direction, entry}
+        self.pending_tracker: dict = {}   # ticket → order_info
+        self.spawn_rounds:    int  = 0    # how many Phase 3 spawns happened
 
     def stop(self):  self._stop.set()
 
@@ -155,13 +162,178 @@ class WatcherWorker(threading.Thread):
     def _delete_obj_levels(self, name):
         write_commands([f"DELETE_PREFIX|{self._obj_prefix(name)}"], symbol=self.symbol)
 
+    def _log_position_map(self, _mt5=None):
+        """Log a clear summary of all active positions and pending orders."""
+        import MetaTrader5 as __mt5
+        mt = _mt5 or __mt5
+        sep = "─" * 55
+        self.log(sep)
+        # Pending orders
+        orders = mt.orders_get(symbol=self.symbol)
+        bot_orders = [o for o in (orders or []) if o.magic == MAGIC_NUMBER]
+        if bot_orders:
+            self.log(f"📋 Pending orders ({len(bot_orders)}):")
+            for o in sorted(bot_orders, key=lambda x: x.price_open):
+                t = "BUY_STOP" if o.type == 2 else "SELL_STOP"
+                comment = getattr(o, 'comment', '')
+                self.log(f"   #{o.ticket} {t:10s} entry={o.price_open:.5f} sl={o.sl:.5f} tp={o.tp:.5f} | {comment}")
+        # Active positions
+        positions = mt.positions_get(symbol=self.symbol)
+        bot_pos = [p for p in (positions or []) if p.magic == MAGIC_NUMBER]
+        if bot_pos:
+            self.log(f"📊 Active positions ({len(bot_pos)}):")
+            for p in sorted(bot_pos, key=lambda x: x.price_open):
+                t = "BUY " if p.type == 0 else "SELL"
+                pnl = p.profit
+                self.log(f"   #{p.ticket} {t} entry={p.price_open:.5f} sl={p.sl:.5f} tp={p.tp:.5f} | PnL={pnl:+.2f}")
+        if not bot_orders and not bot_pos:
+            self.log("   (no bot orders or positions)")
+        self.log(f"   Rounds spawned: {self.spawn_rounds}/9 | Tracked pending: {len(self.pending_tracker)}")
+        self.log(sep)
+
+    def _place_orders_for_source(self, source_price: float, pip_size: float,
+                                  generation: int = 0):
+        """Place 6 pending orders and track tickets for Phase 3 monitoring."""
+        from core.order_manager import place_level_orders
+        try:
+            results = place_level_orders(source_price, pip_size,
+                                          self.pip_step, self.symbol, generation,
+                                          tp_pips=self.tp_pips)
+            ok = sum(1 for r in results if r["ok"])
+            failed = [r for r in results if not r["ok"]]
+
+            # Track placed orders for Phase 3 activation monitoring
+            for r in results:
+                if r["ok"] and r.get("ticket"):
+                    o = r["order"]
+                    self.pending_tracker[r["ticket"]] = {
+                        "level":      o["level"],
+                        "generation": generation,
+                        "source":     source_price,
+                        "direction":  o["type"],
+                        "entry":      o["entry"],
+                        "sl":         o["sl"],
+                        "tp":         o["tp"],
+                    }
+
+            step = self.pip_step * pip_size
+            if ok == len(results):
+                self.log(f"📋  G{generation}: {ok}/6 placed @ {source_price:.5f} | step={step:.5f}")
+                # Show summary: levels above and below
+                for r in results:
+                    o = r["order"]
+                    side = "🟢" if o["type"] == "BUY_STOP" else "🔴"
+                    self.log(f"   {side} G{generation}-L{o['level']} {o['type']:10s} entry={o['entry']:.5f} sl={o['sl']:.5f} tp={o['tp']:.5f}")
+            else:
+                reasons = set(r.get('reason','?') for r in failed)
+                self.log(f"⚠️  G{generation}: {ok}/6 placed | failed: {', '.join(reasons)}", "WARN")
+                for r in results:
+                    o = r["order"]; side = "🟢" if o["type"] == "BUY_STOP" else "🔴"
+                    status = "✅" if r["ok"] else f"❌({r.get('reason','?')[:20]})"
+                    self.log(f"   {side} {status} {o['type']:10s} entry={o['entry']:.5f} sl={o['sl']:.5f}")
+                if "Market closed" in reasons:
+                    self.log(f"💡  Market closed — orders will activate when market opens")
+        except Exception as e:
+            self.log(f"💥  Order error: {type(e).__name__}: {e}", "ERROR")
+
+    def _check_phase3_activations(self, pip: float):
+        """
+        Check if any tracked L2/L3 pending orders became active (triggered).
+        When L2 or L3 is triggered → spawn new source at that entry price.
+        Max 9 rounds total (night range constraint).
+        """
+        if not self.pending_tracker or self.spawn_rounds >= 9:
+            return
+        import MetaTrader5 as _mt5
+        # Get current pending orders from MT5
+        still_pending_tickets = set()
+        pending = _mt5.orders_get(symbol=self.symbol)
+        if pending:
+            for o in pending:
+                if o.magic == MAGIC_NUMBER:
+                    still_pending_tickets.add(o.ticket)
+
+        # Get open positions to see what got triggered
+        positions = _mt5.positions_get(symbol=self.symbol)
+        active_tickets = set()
+        if positions:
+            for p in positions:
+                if p.magic == MAGIC_NUMBER:
+                    # Find by price matching since ticket changes on activation
+                    active_tickets.add(p.ticket)
+
+        # Find tickets that were pending but are now gone (triggered or cancelled)
+        triggered = {t: info for t, info in self.pending_tracker.items()
+                     if t not in still_pending_tickets}
+
+        for ticket, info in list(triggered.items()):
+            level     = info["level"]
+            gen       = info["generation"]
+            entry     = info["entry"]
+            sl        = info["sl"]
+            tp        = info["tp"]
+            direction = info["direction"]
+            side      = "🟢 BUY" if "BUY" in direction else "🔴 SELL"
+
+            self.log(f"⚡  {side} G{gen}-L{level} ACTIVATED | entry={entry:.5f} sl={sl:.5f} tp={tp:.5f} | ticket=#{ticket}", "NEW")
+
+            # Phase 3: L2 and L3 spawn new sources (max 9 rounds, max gen 2)
+            # Dynamic spawn level from GUI
+            spawn_lvls = []
+            if "L2" in self.spawn_on: spawn_lvls.append(2)
+            if "L3" in self.spawn_on: spawn_lvls.append(3)
+            if level in spawn_lvls and gen < 2 and self.spawn_rounds < 9:
+                # Prevent duplicate: check if we already spawned from this exact entry+gen
+                spawn_key = f"{entry:.5f}_G{gen+1}"
+                if spawn_key in getattr(self, "spawned_keys", set()):
+                    self.log(f"ℹ️  Already spawned G{gen+1} @ {entry:.5f} — skipping duplicate")
+                else:
+                    if not hasattr(self, "spawned_keys"):
+                        self.spawned_keys = set()
+                    self.spawned_keys.add(spawn_key)
+                    self.spawn_rounds += 1
+                    new_gen = gen + 1
+                    self.log(
+                        f"🔄  Phase 3 round {self.spawn_rounds}/9 — "
+                        f"G{gen}-L{level} {direction} triggered @ {entry:.5f} → "
+                        f"new source G{new_gen} @ {entry:.5f}", "NEW")
+                    spawn_name = f"TB_SPAWN_G{new_gen}_R{self.spawn_rounds}"
+                    self._draw_hline_levels(spawn_name, entry, pip)
+                    self._place_orders_for_source(entry, pip, generation=new_gen)
+                    self._log_position_map(_mt5)
+            elif level == 1:
+                self.log(f"ℹ️  G{gen}-L1 activated — no spawn (L1 does not spawn new source)")
+            elif self.spawn_rounds >= 9:
+                self.log(f"⛔  Max 9 rounds reached — no more spawning")
+            elif gen >= 2:
+                self.log(f"ℹ️  G{gen}-L{level} activated — max generation reached (gen 2)")
+
+            del self.pending_tracker[ticket]
+
     def run(self):
         if not cw.connect_mt5():
             self.sig.status.emit("❌  MT5 connection failed"); return
         pip = get_pip_size(self.symbol)
-        self.log(f"✅  Connected | {self.symbol} | pip={pip:.5f} | step={self.pip_step} pips")
+
+        # Log minimum stop distance so user knows if pip_step is too small
+        import MetaTrader5 as _mt5
+        _mt5.symbol_select(self.symbol, True)
+        _info = _mt5.symbol_info(self.symbol)
+        if _info:
+            min_dist = _info.trade_stops_level * _info.point
+            min_pips = min_dist / pip if pip > 0 else 0
+            self.log(f"✅  Connected | {self.symbol} | pip={pip:.5f} | step={self.pip_step} pips")
+            self.log(f"📐  Min stop distance: {min_dist:.5f} = {min_pips:.1f} pips  (pip_step must be > {min_pips:.1f})")
+            if self.pip_step * pip <= min_dist:
+                self.log(f"⚠️  pip_step={self.pip_step} is too small! L1 SL will fail. Increase to >{min_pips:.0f} pips.", "WARN")
+        else:
+            self.log(f"✅  Connected | {self.symbol} | pip={pip:.5f} | step={self.pip_step} pips")
+
         self.sig.status.emit("🟢  Running")
-        self._ea_sym = None  # track EA chart
+
+        # source_registry: name → {"src": float, "triggered": bool, "gen": int}
+        # Orders are placed ONLY when price touches the source line
+        source_registry = {}
 
         while not self._stop.is_set():
           try:
@@ -171,80 +343,145 @@ class WatcherWorker(threading.Thread):
                 self._stop.wait(SCAN_INTERVAL_SEC); continue
 
             parsed = cw.parse_objects_file(path)
-            trader, auto, ea_sym = parsed if len(parsed) == 3 else (parsed[0], parsed[1], None)
+            if len(parsed) == 4:
+                trader, auto, ea_sym, candle = parsed
+            elif len(parsed) == 3:
+                trader, auto, ea_sym, candle = parsed[0], parsed[1], parsed[2], {}
+            else:
+                trader, auto, ea_sym, candle = parsed[0], parsed[1], None, {}
 
-            # Update EA chart label in header
             if ea_sym:
                 self.sig.log_line.emit(f"__EA_SYM__{ea_sym}", "EA")
 
-            # Warn once if EA is on wrong chart, then skip
             if ea_sym and ea_sym != self.symbol:
                 if ea_sym != getattr(self, "_last_ea_warn", None):
                     self._last_ea_warn = ea_sym
-                    self.log(f"⚠️  EA is on {ea_sym}. Switch bot symbol to {ea_sym}, "
-                             f"or move EA to your {self.symbol} chart.", "WARN")
+                    self.log(f"⚠️  EA is on {ea_sym} chart — not {self.symbol}. Move EA or change symbol.", "WARN")
                 self._stop.wait(SCAN_INTERVAL_SEC)
                 continue
 
             self.sig.new_objects.emit(trader, auto)
             cur = {o.name for o in trader}
 
-            # NEW objects
+            # Get current price once per scan
+            tick = mt5.symbol_info_tick(self.symbol)
+            current_price = (tick.bid + tick.ask) / 2 if tick else 0.0
+
+            # ── DETECT NEW OBJECTS ─────────────────────────────────
             for n in cur - self.prev_names:
+                if n in self.drawn:
+                    continue  # already processed
+
                 obj = next(o for o in trader if o.name == n)
-                self.log(f"🆕  [{n}]  {obj.obj_type}  @ {obj.price1:.5f}", "NEW")
+
+                # Skip wrong-symbol artifacts (price far from current)
+                if current_price > 0 and obj.price1 > 0:
+                    ratio = obj.price1 / current_price
+                    if ratio < 0.5 or ratio > 2.0:
+                        self.drawn[n] = "WRONG_SYMBOL"
+                        self.log(f"⏭  [{n[:25]}] @ {obj.price1:.5f} skipped (current={current_price:.5f}, ratio={ratio:.2f})")
+                        continue
+
                 if obj.is_hline:
-                    step = self._draw_hline_levels(n, obj.price1, pip)
-                    self.drawn[n] = obj.price1
-                    self.log(f"🎯  3+3 levels around {obj.price1:.5f}  [step={step:.5f}]")
+                    src = obj.price1
+                    self._draw_hline_levels(n, src, pip)
+                    self.drawn[n] = src
+                    # Record the CURRENT candle time — only check touch on FUTURE candles
+                    cur_candle_t = candle.get("CANDLE_T", 0)
+                    source_registry[n] = {"src": src, "triggered": False, "gen": 0,
+                                          "registered_at_candle": cur_candle_t}
+                    self.log(f"🆕  HLINE [{n[:25]}] @ {src:.5f} | 3+3 levels drawn | waiting for NEXT candle to touch line")
+
                 elif obj.is_rectangle:
                     if not obj.rect_valid:
-                        self.log(f"⏳  Rectangle not fully drawn yet — will retry", "INFO")
+                        self.drawn[n] = "INVALID"
+                        self.log(f"⚠️  [{n[:25]}] rectangle has zero height — skipping")
                         continue
-                    step = self._draw_rect_levels(n, obj.rect_top, obj.rect_bottom, pip)
-                    self.drawn[n] = ("RECT", obj.rect_top, obj.rect_bottom)
-                    self.log(f"🟦  top={obj.rect_top:.5f} bottom={obj.rect_bottom:.5f}  [step={step:.5f}]", "NEW")
+                    center = round((obj.rect_top + obj.rect_bottom) / 2, 5)
+                    self._draw_hline_levels(n, center, pip)
+                    self.drawn[n] = center
+                    source_registry[n] = {"src": center, "triggered": False, "gen": 0}
+                    self.log(f"🆕  RECT [{n[:25]}] center={center:.5f} (h={obj.rect_height:.5f}) | 3+3 levels drawn | waiting for touch")
 
-            # REMOVED objects - delete only their own lines
-            for n in self.prev_names - cur:
-                self.log(f"🗑️   Removed: [{n}]", "WARN")
-                if n in self.drawn:
-                    self._delete_obj_levels(n)
-                    del self.drawn[n]
-                    self.log(f"🧹  Cleared levels for [{n}]")
+            # ── CHECK PREVIOUS CLOSED CANDLE TOUCHES SOURCE LINES ──
+            # Use the LAST CLOSED candle (PREV_*) not the forming one.
+            # This prevents same-candle buy+sell activation.
+            cur_candle_t  = candle.get("CANDLE_T", 0)
+            prev_h = candle.get("PREV_H", 0.0)
+            prev_l = candle.get("PREV_L", 0.0)
+            prev_c = candle.get("PREV_C", 0.0)
+            prev_o = candle.get("PREV_O", 0.0)
+            prev_t = candle.get("PREV_T", 0)
 
-            # FOLLOW moved objects
+            for n, reg in list(source_registry.items()):
+                if reg["triggered"]:
+                    continue
+                src = reg["src"]
+
+                # Skip if prev candle hasn't changed since last check
+                last_checked = reg.get("last_prev_t", 0)
+                if prev_t == last_checked:
+                    continue  # Same prev candle — already checked
+                reg["last_prev_t"] = prev_t
+
+                # Skip if prev candle is the same as when line was registered
+                registered_at = reg.get("registered_at_candle", 0)
+                if prev_t <= registered_at:
+                    continue  # Line drawn on this or a newer candle — wait
+
+                # Touch = previous closed candle's range includes the source line
+                if prev_h > 0 and prev_l > 0 and prev_l <= src <= prev_h:
+                    side = "from above" if prev_o > src else "from below"
+                    if reg["triggered"]:
+                        # Pullback re-entry: price returned to source after a round started
+                        # Reset and place orders again (new round on same source)
+                        reg["triggered"] = True  # keep as triggered
+                        self.log(
+                            f"🔁  Pullback to source [{n[:20]}] @ {src:.5f} {side} | "
+                            f"placing fresh orders on original source", "NEW")
+                        self._place_orders_for_source(src, pip, generation=0)
+                    else:
+                        reg["triggered"] = True
+                        self.log(
+                            f"🎯  Candle [{n[:20]}] touched source @ {src:.5f} {side} | "
+                            f"H={prev_h:.5f} L={prev_l:.5f} C={prev_c:.5f} → placing orders", "NEW")
+                        self._place_orders_for_source(src, pip, generation=reg["gen"])
+
+            # ── PHASE 3: CHECK ACTIVATIONS ───────────────────────────
+            self._check_phase3_activations(pip)
+
+            # ── FOLLOW MOVED OBJECTS ───────────────────────────────
             if self.follow_enabled:
                 for obj in trader:
-                    if obj.name not in self.drawn:
+                    n = obj.name
+                    if n not in self.drawn or self.drawn[n] in ("INVALID", "WRONG_SYMBOL"):
                         continue
-                    stored = self.drawn[obj.name]
-                    if obj.is_hline and not isinstance(stored, tuple):
+                    stored = self.drawn[n]
+                    if obj.is_hline and isinstance(stored, float):
                         if abs(obj.price1 - stored) > 0.00001:
-                            self.log(f"↕️   [{obj.name}] moved → redrawing")
-                            self._draw_hline_levels(obj.name, obj.price1, pip)
-                            self.drawn[obj.name] = obj.price1
-                    elif obj.is_rectangle and isinstance(stored, tuple) and obj.rect_valid:
-                        _, old_top, old_bot = stored
-                        if (abs(obj.rect_top - old_top) > 0.00001 or
-                                abs(obj.rect_bottom - old_bot) > 0.00001):
-                            self.log(f"↕️   [{obj.name}] rect moved → redrawing")
-                            self._draw_rect_levels(obj.name, obj.rect_top, obj.rect_bottom, pip)
-                            self.drawn[obj.name] = ("RECT", obj.rect_top, obj.rect_bottom)
+                            new_src = obj.price1
+                            self.log(f"↕️  [{n[:25]}] moved {stored:.5f}→{new_src:.5f} — redrawing levels")
+                            self._draw_hline_levels(n, new_src, pip)
+                            self.drawn[n] = new_src
+                            if n in source_registry:
+                                source_registry[n]["src"] = new_src
+                                source_registry[n]["triggered"] = False  # reset touch
+                                source_registry[n]["registered_at_candle"] = prev_t  # wait for next candle after move
 
-            self.prev_names = cur
+            self.prev_names = self.prev_names | cur
             self._stop.wait(SCAN_INTERVAL_SEC)
+
           except Exception as _e:
             import traceback as _tb
-            self.log(f"💥 Watcher error: {_e}", "ERROR")
-            for _line in _tb.format_exc().splitlines():
+            self.log(f"💥 Watcher error: {type(_e).__name__}: {_e}", "ERROR")
+            for _line in _tb.format_exc().strip().splitlines():
                 self.log(f"   {_line}", "ERROR")
             self._stop.wait(SCAN_INTERVAL_SEC)
 
         write_commands(["DELETE_PREFIX|TB_"], symbol=self.symbol)
         mt5.shutdown()
         self.sig.status.emit("⚫  Stopped")
-        self.log("Bot stopped.")
+        self.log("Bot stopped — all bot lines cleared")
 
 
 # ── Main Window ──────────────────────────────────────────────────
@@ -329,6 +566,24 @@ class GUI(QMainWindow):
         self.spin_pip.setRange(0.1, 200.0); self.spin_pip.setSingleStep(0.5)
         self.spin_pip.setValue(PIP_STEP);   self.spin_pip.setDecimals(1)
         hl_pip.addWidget(self.spin_pip); hl_pip.addStretch(); cl.addLayout(hl_pip)
+
+        # TP pips (0 = use RR ratio, >0 = fixed pip TP from L3)
+        hl_tp = QHBoxLayout()
+        hl_tp.addWidget(QLabel("TP pips:"))
+        self.spin_tp = QDoubleSpinBox()
+        self.spin_tp.setRange(0, 500.0); self.spin_tp.setSingleStep(5.0)
+        self.spin_tp.setValue(0); self.spin_tp.setDecimals(1)
+        self.spin_tp.setToolTip("Fixed TP in pips from L3 for all positions in a round.\n0 = use RR ratio from config")
+        hl_tp.addWidget(self.spin_tp); hl_tp.addStretch(); cl.addLayout(hl_tp)
+
+        # Spawn level: which level triggers a new round
+        hl_spawn = QHBoxLayout()
+        hl_spawn.addWidget(QLabel("Spawn on:"))
+        self.combo_spawn = QComboBox()
+        self.combo_spawn.addItems(["L2 only", "L3 only", "L2 and L3"])
+        self.combo_spawn.setCurrentText("L2 and L3")
+        self.combo_spawn.setToolTip("Which activated level triggers a new Phase 3 round")
+        hl_spawn.addWidget(self.combo_spawn); hl_spawn.addStretch(); cl.addLayout(hl_spawn)
         self.btn_start = QPushButton("▶  Start Watcher"); self.btn_start.setObjectName("btn_start")
         self.btn_start.setMinimumHeight(38); self.btn_start.clicked.connect(self._start)
         cl.addWidget(self.btn_start)
@@ -548,8 +803,11 @@ class GUI(QMainWindow):
     def _start(self):
         self._pip_step = self.spin_pip.value()
         self.spin_pip.setEnabled(False)
-        active_sym = self.sym_combo.currentText().strip() or WATCH_SYMBOL
-        self._worker = WatcherWorker(self._sig, self._pip_step, symbol=active_sym)
+        active_sym   = self.sym_combo.currentText().strip() or WATCH_SYMBOL
+        self._tp_pips   = self.spin_tp.value()
+        self._spawn_lvls = self.combo_spawn.currentText()
+        self._worker = WatcherWorker(self._sig, self._pip_step, symbol=active_sym,
+                                      tp_pips=self._tp_pips, spawn_on=self._spawn_lvls)
         self._worker.follow_enabled = self.chk_follow.isChecked()
         self._worker.start()
         self.btn_start.setEnabled(False); self.btn_stop.setEnabled(True)
@@ -644,11 +902,18 @@ class GUI(QMainWindow):
         self.tabs.setCurrentIndex(1)
 
     def _cancel_orders(self):
-        n = cancel_all_tb_orders(self.sym_combo.currentText().strip() or WATCH_SYMBOL)
-        sym = self.sym_combo.currentText().strip() or WATCH_SYMBOL
-        write_commands(["DELETE_PREFIX|TB_"], symbol=sym)   # clear all bot level lines
-        self._on_log(f"{datetime.now().strftime('%H:%M:%S')}  🗑️  Cancelled {n} bot orders + cleared all level lines", "WARN")
-        self.ord_tbl.setRowCount(0)
+        # Guard against multiple rapid calls
+        if getattr(self, "_cancelling", False):
+            return
+        self._cancelling = True
+        try:
+            sym = self.sym_combo.currentText().strip() or WATCH_SYMBOL
+            n = cancel_all_tb_orders(sym)
+            write_commands(["DELETE_PREFIX|TB_"], symbol=sym)
+            self._on_log(f"{datetime.now().strftime('%H:%M:%S')}  🗑️  Cancelled {n} bot orders + cleared all level lines", "WARN")
+            self.ord_tbl.setRowCount(0)
+        finally:
+            self._cancelling = False
 
     def _run_backtest(self):
         if self._bt_running:
