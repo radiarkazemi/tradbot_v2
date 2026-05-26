@@ -4,20 +4,7 @@
 ║  pip install PyQt5   →   python gui.py                          ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
-from chart_widget import CandleChartWidget
-from core import chart_watcher as cw
-from core.backtest_engine import run_backtest
-from core.order_manager import place_level_orders, send_orders, cancel_all_tb_orders
-from core.line_drawer import draw_level_lines, clear_level_lines, get_pip_size, write_commands, STYLE_DASH, CLR_ABOVE_1, CLR_ABOVE_2, CLR_ABOVE_3, CLR_BELOW_1, CLR_BELOW_2, CLR_BELOW_3
-from config import (
-    MT5_LOGIN, MT5_PASSWORD, MT5_SERVER,
-    WATCH_SYMBOL, SCAN_INTERVAL_SEC,
-    AUTO_OBJECT_PREFIXES, PIP_STEP, BOT_LINE_PREFIX,
-    LOT_SIZE, TP_RR_RATIO, MAGIC_NUMBER,
-)
-import sys
-import os
-import threading
+import sys, os, threading
 from datetime import datetime
 from typing import Optional
 
@@ -33,15 +20,26 @@ from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject
 from PyQt5.QtGui import QColor, QTextCursor, QFont
 
 os.makedirs("logs", exist_ok=True)
+from config import (
+    MT5_LOGIN, MT5_PASSWORD, MT5_SERVER,
+    WATCH_SYMBOL, SCAN_INTERVAL_SEC,
+    AUTO_OBJECT_PREFIXES, PIP_STEP, BOT_LINE_PREFIX,
+    LOT_SIZE, TP_RR_RATIO, MAGIC_NUMBER,
+)
+from core.line_drawer  import draw_level_lines, clear_level_lines, get_pip_size, write_commands, STYLE_DASH, CLR_ABOVE_1, CLR_ABOVE_2, CLR_ABOVE_3, CLR_BELOW_1, CLR_BELOW_2, CLR_BELOW_3
+from core.order_manager import place_level_orders, send_orders, cancel_all_tb_orders
+from core.backtest_engine import run_backtest
+from core import chart_watcher as cw
+from chart_widget import CandleChartWidget
 
 # ── Palette ──────────────────────────────────────────────────────
 C = {
-    "bg": "#0D1117", "panel": "#161B22", "card": "#1C2333", "input": "#141D2E",
-    "border": "#2A3550", "border_hi": "#4A6090",
-    "txt": "#E8EDF5", "txt2": "#8B9BB4", "txt3": "#4A5568",
-    "gold": "#F5A623", "green": "#00D97E", "green_dk": "#003D22",
-    "red": "#FF4560", "red_dk": "#3D0015", "orange": "#FF8C00",
-    "cyan": "#00BCD4", "blue": "#2979FF", "purple": "#B388FF",
+    "bg":"#0D1117","panel":"#161B22","card":"#1C2333","input":"#141D2E",
+    "border":"#2A3550","border_hi":"#4A6090",
+    "txt":"#E8EDF5","txt2":"#8B9BB4","txt3":"#4A5568",
+    "gold":"#F5A623","green":"#00D97E","green_dk":"#003D22",
+    "red":"#FF4560","red_dk":"#3D0015","orange":"#FF8C00",
+    "cyan":"#00BCD4","blue":"#2979FF","purple":"#B388FF",
 }
 
 SS = f"""
@@ -105,9 +103,9 @@ QSplitter::handle {{ background:{C['border']}; }}
 # ── Watcher signals & worker ──────────────────────────────────────
 class Sig(QObject):
     new_objects = pyqtSignal(list, list)
-    status = pyqtSignal(str)
-    log_line = pyqtSignal(str, str)
-    bt_done = pyqtSignal()
+    status      = pyqtSignal(str)
+    log_line    = pyqtSignal(str, str)
+    bt_done     = pyqtSignal()
 
 
 class WatcherWorker(threading.Thread):
@@ -115,27 +113,26 @@ class WatcherWorker(threading.Thread):
                  tp_pips: float = 0.0, spawn_on: str = "L2 and L3",
                  lot_size: float = 0.01):
         super().__init__(daemon=True)
-        self.sig = sig
-        self.pip_step = pip_step
-        self.symbol = symbol
-        self._stop = threading.Event()
-        self.prev_names: set = set()
-        self.drawn:     dict = {}
+        self.sig       = sig
+        self.pip_step  = pip_step
+        self.symbol    = symbol
+        self._stop     = threading.Event()
+        self.prev_names: set  = set()
+        self.drawn:     dict  = {}
         self.follow_enabled: bool = True
-        self.tp_pips = tp_pips
-        self.spawn_on = spawn_on
-        self.lot_size = lot_size
-        self.orders_placed: set = set()
-        self._last_direction: str = '—'  # 'BUY', 'SELL', or '—'
+        self.tp_pips      = tp_pips
+        self.spawn_on     = spawn_on
+        self.lot_size     = lot_size
+        self.orders_placed: set  = set()
+        self._last_direction: str  = '—'  # 'BUY', 'SELL', or '—'
         # Phase 3: track pending orders by ticket → {level, gen, src, direction, entry}
         self.pending_tracker: dict = {}   # ticket → order_info
-        self.spawn_rounds:    int = 0    # how many Phase 3 spawns happened
+        self.spawn_rounds:    int  = 0    # how many Phase 3 spawns happened
 
     def stop(self):  self._stop.set()
 
     def log(self, msg, lvl="INFO"):
-        self.sig.log_line.emit(
-            f"{datetime.now().strftime('%H:%M:%S')}  {msg}", lvl)
+        self.sig.log_line.emit(f"{datetime.now().strftime('%H:%M:%S')}  {msg}", lvl)
 
     @staticmethod
     def _obj_prefix(name: str) -> str:
@@ -145,33 +142,28 @@ class WatcherWorker(threading.Thread):
 
     def _draw_hline_levels(self, name, price, pip_size):
         prefix = self._obj_prefix(name)
-        step = self.pip_step * pip_size
-        cmds = [f"DELETE_PREFIX|{prefix}"]
+        step   = self.pip_step * pip_size
+        cmds   = [f"DELETE_PREFIX|{prefix}"]
         for i, clr in enumerate([CLR_ABOVE_1, CLR_ABOVE_2, CLR_ABOVE_3], 1):
-            cmds.append(
-                f"DRAW_HLINE|{prefix}A{i}|{price + step*i:.5f}|{clr}|1|{STYLE_DASH}")
+            cmds.append(f"DRAW_HLINE|{prefix}A{i}|{price + step*i:.5f}|{clr}|1|{STYLE_DASH}")
         for i, clr in enumerate([CLR_BELOW_1, CLR_BELOW_2, CLR_BELOW_3], 1):
-            cmds.append(
-                f"DRAW_HLINE|{prefix}B{i}|{price - step*i:.5f}|{clr}|1|{STYLE_DASH}")
+            cmds.append(f"DRAW_HLINE|{prefix}B{i}|{price - step*i:.5f}|{clr}|1|{STYLE_DASH}")
         write_commands(cmds, symbol=self.symbol)
         return step
 
     def _draw_rect_levels(self, name, top, bottom, pip_size):
         prefix = self._obj_prefix(name)
-        step = self.pip_step * pip_size
-        cmds = [f"DELETE_PREFIX|{prefix}"]
+        step   = self.pip_step * pip_size
+        cmds   = [f"DELETE_PREFIX|{prefix}"]
         for i, clr in enumerate([CLR_ABOVE_1, CLR_ABOVE_2, CLR_ABOVE_3], 1):
-            cmds.append(
-                f"DRAW_HLINE|{prefix}A{i}|{top + step*i:.5f}|{clr}|1|{STYLE_DASH}")
+            cmds.append(f"DRAW_HLINE|{prefix}A{i}|{top    + step*i:.5f}|{clr}|1|{STYLE_DASH}")
         for i, clr in enumerate([CLR_BELOW_1, CLR_BELOW_2, CLR_BELOW_3], 1):
-            cmds.append(
-                f"DRAW_HLINE|{prefix}B{i}|{bottom - step*i:.5f}|{clr}|1|{STYLE_DASH}")
+            cmds.append(f"DRAW_HLINE|{prefix}B{i}|{bottom - step*i:.5f}|{clr}|1|{STYLE_DASH}")
         write_commands(cmds, symbol=self.symbol)
         return step
 
     def _delete_obj_levels(self, name):
-        write_commands(
-            [f"DELETE_PREFIX|{self._obj_prefix(name)}"], symbol=self.symbol)
+        write_commands([f"DELETE_PREFIX|{self._obj_prefix(name)}"], symbol=self.symbol)
 
     def _log_position_map(self, _mt5=None):
         """Log a clear summary of all active positions and pending orders."""
@@ -187,8 +179,7 @@ class WatcherWorker(threading.Thread):
             for o in sorted(bot_orders, key=lambda x: x.price_open):
                 t = "BUY_STOP" if o.type == 2 else "SELL_STOP"
                 comment = getattr(o, 'comment', '')
-                self.log(
-                    f"   #{o.ticket} {t:10s} entry={o.price_open:.5f} sl={o.sl:.5f} tp={o.tp:.5f} | {comment}")
+                self.log(f"   #{o.ticket} {t:10s} entry={o.price_open:.5f} sl={o.sl:.5f} tp={o.tp:.5f} | {comment}")
         # Active positions
         positions = mt.positions_get(symbol=self.symbol)
         bot_pos = [p for p in (positions or []) if p.magic == MAGIC_NUMBER]
@@ -197,23 +188,21 @@ class WatcherWorker(threading.Thread):
             for p in sorted(bot_pos, key=lambda x: x.price_open):
                 t = "BUY " if p.type == 0 else "SELL"
                 pnl = p.profit
-                self.log(
-                    f"   #{p.ticket} {t} entry={p.price_open:.5f} sl={p.sl:.5f} tp={p.tp:.5f} | PnL={pnl:+.2f}")
+                self.log(f"   #{p.ticket} {t} entry={p.price_open:.5f} sl={p.sl:.5f} tp={p.tp:.5f} | PnL={pnl:+.2f}")
         if not bot_orders and not bot_pos:
             self.log("   (no bot orders or positions)")
-        self.log(
-            f"   Rounds spawned: {self.spawn_rounds}/9 | Tracked pending: {len(self.pending_tracker)}")
+        self.log(f"   Rounds spawned: {self.spawn_rounds}/9 | Tracked pending: {len(self.pending_tracker)}")
         self.log(sep)
 
     def _place_orders_for_source(self, source_price: float, pip_size: float,
-                                 generation: int = 0):
+                                  generation: int = 0):
         """Place 6 pending orders and track tickets for Phase 3 monitoring."""
         from core.order_manager import place_level_orders
         try:
             results = place_level_orders(source_price, pip_size,
-                                         self.pip_step, self.symbol, generation,
-                                         tp_pips=self.tp_pips,
-                                         lot_size=self.lot_size)
+                                          self.pip_step, self.symbol, generation,
+                                          tp_pips=self.tp_pips,
+                                          lot_size=self.lot_size)
             ok = sum(1 for r in results if r["ok"])
             failed = [r for r in results if not r["ok"]]
 
@@ -233,27 +222,21 @@ class WatcherWorker(threading.Thread):
 
             step = self.pip_step * pip_size
             if ok == len(results):
-                self.log(
-                    f"📋  G{generation}: {ok}/6 placed @ {source_price:.5f} | step={step:.5f}")
+                self.log(f"📋  G{generation}: {ok}/6 placed @ {source_price:.5f} | step={step:.5f}")
                 # Show summary: levels above and below
                 for r in results:
                     o = r["order"]
                     side = "🟢" if o["type"] == "BUY_STOP" else "🔴"
-                    self.log(
-                        f"   {side} G{generation}-L{o['level']} {o['type']:10s} entry={o['entry']:.5f} sl={o['sl']:.5f} tp={o['tp']:.5f}")
+                    self.log(f"   {side} G{generation}-L{o['level']} {o['type']:10s} entry={o['entry']:.5f} sl={o['sl']:.5f} tp={o['tp']:.5f}")
             else:
-                reasons = set(r.get('reason', '?') for r in failed)
-                self.log(
-                    f"⚠️  G{generation}: {ok}/6 placed | failed: {', '.join(reasons)}", "WARN")
+                reasons = set(r.get('reason','?') for r in failed)
+                self.log(f"⚠️  G{generation}: {ok}/6 placed | failed: {', '.join(reasons)}", "WARN")
                 for r in results:
-                    o = r["order"]
-                    side = "🟢" if o["type"] == "BUY_STOP" else "🔴"
-                    status = "✅" if r["ok"] else f"❌({r.get('reason', '?')[:20]})"
-                    self.log(
-                        f"   {side} {status} {o['type']:10s} entry={o['entry']:.5f} sl={o['sl']:.5f}")
+                    o = r["order"]; side = "🟢" if o["type"] == "BUY_STOP" else "🔴"
+                    status = "✅" if r["ok"] else f"❌({r.get('reason','?')[:20]})"
+                    self.log(f"   {side} {status} {o['type']:10s} entry={o['entry']:.5f} sl={o['sl']:.5f}")
                 if "Market closed" in reasons:
-                    self.log(
-                        f"💡  Market closed — orders will activate when market opens")
+                    self.log(f"💡  Market closed — orders will activate when market opens")
         except Exception as e:
             self.log(f"💥  Order error: {type(e).__name__}: {e}", "ERROR")
 
@@ -288,33 +271,37 @@ class WatcherWorker(threading.Thread):
                      if t not in still_pending_tickets}
 
         for ticket, info in list(triggered.items()):
-            level = info["level"]
-            gen = info["generation"]
-            entry = info["entry"]
-            sl = info["sl"]
-            tp = info["tp"]
+            level     = info["level"]
+            gen       = info["generation"]
+            entry     = info["entry"]
+            sl        = info["sl"]
+            tp        = info["tp"]
             direction = info["direction"]
-            side = "🟢 BUY" if "BUY" in direction else "🔴 SELL"
+            side      = "🟢 BUY" if "BUY" in direction else "🔴 SELL"
 
-            self.log(
-                f"⚡  {side} G{gen}-L{level} ACTIVATED | entry={entry:.5f} sl={sl:.5f} tp={tp:.5f} | ticket=#{ticket}", "NEW")
+            self.log(f"⚡  {side} G{gen}-L{level} ACTIVATED | entry={entry:.5f} sl={sl:.5f} tp={tp:.5f} | ticket=#{ticket}", "NEW")
 
-            # Phase 3: L2 and L3 spawn new sources (max 9 rounds, max gen 2)
+            # Phase 3: L2/L3 spawn new sources
             # Dynamic spawn level from GUI
             spawn_lvls = []
-            if "L2" in self.spawn_on:
-                spawn_lvls.append(2)
-            if "L3" in self.spawn_on:
-                spawn_lvls.append(3)
-            if level in spawn_lvls and gen < 2 and self.spawn_rounds < 9:
-                # Prevent duplicate: check if we already spawned from this exact entry+gen
-                spawn_key = f"{entry:.5f}_G{gen+1}"
-                if spawn_key in getattr(self, "spawned_keys", set()):
-                    self.log(
-                        f"ℹ️  Already spawned G{gen+1} @ {entry:.5f} — skipping duplicate")
+            if "L2" in self.spawn_on: spawn_lvls.append(2)
+            if "L3" in self.spawn_on: spawn_lvls.append(3)
+
+            if level not in spawn_lvls:
+                if level == 1:
+                    self.log(f"ℹ️  G{gen}-L1 activated — L1 never spawns")
                 else:
-                    if not hasattr(self, "spawned_keys"):
-                        self.spawned_keys = set()
+                    self.log(f"ℹ️  G{gen}-L{level} activated — not in spawn levels ({self.spawn_on})")
+            elif self.spawn_rounds >= 9:
+                self.log(f"⛔  Max 9 rounds reached — G{gen}-L{level} activated but no spawn")
+            else:
+                # spawn_key includes direction so BUY and SELL from same price both spawn
+                spawn_key = f"{entry:.5f}_G{gen+1}_{direction[:4]}"
+                if not hasattr(self, "spawned_keys"):
+                    self.spawned_keys = set()
+                if spawn_key in self.spawned_keys:
+                    self.log(f"ℹ️  Already spawned from {entry:.5f} {direction[:4]} — skipping duplicate")
+                else:
                     self.spawned_keys.add(spawn_key)
                     self.spawn_rounds += 1
                     new_gen = gen + 1
@@ -324,24 +311,14 @@ class WatcherWorker(threading.Thread):
                         f"new source G{new_gen} @ {entry:.5f}", "NEW")
                     spawn_name = f"TB_SPAWN_G{new_gen}_R{self.spawn_rounds}"
                     self._draw_hline_levels(spawn_name, entry, pip)
-                    self._place_orders_for_source(
-                        entry, pip, generation=new_gen)
+                    self._place_orders_for_source(entry, pip, generation=new_gen)
                     self._log_position_map(_mt5)
-            elif level == 1:
-                self.log(
-                    f"ℹ️  G{gen}-L1 activated — no spawn (L1 does not spawn new source)")
-            elif self.spawn_rounds >= 9:
-                self.log(f"⛔  Max 9 rounds reached — no more spawning")
-            elif gen >= 2:
-                self.log(
-                    f"ℹ️  G{gen}-L{level} activated — max generation reached (gen 2)")
 
             del self.pending_tracker[ticket]
 
     def run(self):
         if not cw.connect_mt5():
-            self.sig.status.emit("❌  MT5 connection failed")
-            return
+            self.sig.status.emit("❌  MT5 connection failed"); return
         pip = get_pip_size(self.symbol)
 
         # Log minimum stop distance so user knows if pip_step is too small
@@ -351,16 +328,12 @@ class WatcherWorker(threading.Thread):
         if _info:
             min_dist = _info.trade_stops_level * _info.point
             min_pips = min_dist / pip if pip > 0 else 0
-            self.log(
-                f"✅  Connected | {self.symbol} | pip={pip:.5f} | step={self.pip_step} pips")
-            self.log(
-                f"📐  Min stop distance: {min_dist:.5f} = {min_pips:.1f} pips  (pip_step must be > {min_pips:.1f})")
+            self.log(f"✅  Connected | {self.symbol} | pip={pip:.5f} | step={self.pip_step} pips | TP={self.tp_pips:.0f}pips | spawn={self.spawn_on}")
+            self.log(f"📐  Min stop distance: {min_dist:.5f} = {min_pips:.1f} pips  (pip_step must be > {min_pips:.1f})")
             if self.pip_step * pip <= min_dist:
-                self.log(
-                    f"⚠️  pip_step={self.pip_step} is too small! L1 SL will fail. Increase to >{min_pips:.0f} pips.", "WARN")
+                self.log(f"⚠️  pip_step={self.pip_step} is too small! L1 SL will fail. Increase to >{min_pips:.0f} pips.", "WARN")
         else:
-            self.log(
-                f"✅  Connected | {self.symbol} | pip={pip:.5f} | step={self.pip_step} pips")
+            self.log(f"✅  Connected | {self.symbol} | pip={pip:.5f} | step={self.pip_step} pips")
 
         self.sig.status.emit("🟢  Running")
 
@@ -374,15 +347,13 @@ class WatcherWorker(threading.Thread):
             path = cw.find_objects_file(self.symbol)
             if not path:
                 self.sig.status.emit("⏳  Waiting for EA…")
-                self._stop.wait(SCAN_INTERVAL_SEC)
-                continue
+                self._stop.wait(SCAN_INTERVAL_SEC); continue
 
             parsed = cw.parse_objects_file(path)
             if len(parsed) == 4:
                 trader, auto, ea_sym, candle = parsed
             elif len(parsed) == 3:
-                trader, auto, ea_sym, candle = parsed[0], parsed[1], parsed[2], {
-                }
+                trader, auto, ea_sym, candle = parsed[0], parsed[1], parsed[2], {}
             else:
                 trader, auto, ea_sym, candle = parsed[0], parsed[1], None, {}
 
@@ -392,12 +363,12 @@ class WatcherWorker(threading.Thread):
             if ea_sym and ea_sym != self.symbol:
                 if ea_sym != getattr(self, "_last_ea_warn", None):
                     self._last_ea_warn = ea_sym
-                    self.log(
-                        f"⚠️  EA is on {ea_sym} chart — not {self.symbol}. Move EA or change symbol.", "WARN")
+                    self.log(f"⚠️  EA is on {ea_sym} chart — not {self.symbol}. Move EA or change symbol.", "WARN")
                 self._stop.wait(SCAN_INTERVAL_SEC)
                 continue
 
             self.sig.new_objects.emit(trader, auto)
+            self.sig.log_line.emit(f"__CANDLE__{repr(candle)}", "RF")
             cur = {o.name for o in trader}
 
             # Get current price once per scan
@@ -416,8 +387,7 @@ class WatcherWorker(threading.Thread):
                     ratio = obj.price1 / current_price
                     if ratio < 0.5 or ratio > 2.0:
                         self.drawn[n] = "WRONG_SYMBOL"
-                        self.log(
-                            f"⏭  [{n[:25]}] @ {obj.price1:.5f} skipped (current={current_price:.5f}, ratio={ratio:.2f})")
+                        self.log(f"⏭  [{n[:25]}] @ {obj.price1:.5f} skipped (current={current_price:.5f}, ratio={ratio:.2f})")
                         continue
 
                 if obj.is_hline:
@@ -428,27 +398,23 @@ class WatcherWorker(threading.Thread):
                     cur_candle_t = candle.get("CANDLE_T", 0)
                     source_registry[n] = {"src": src, "triggered": False, "gen": 0,
                                           "registered_at_candle": cur_candle_t}
-                    self.log(
-                        f"🆕  HLINE [{n[:25]}] @ {src:.5f} | 3+3 levels drawn | waiting for NEXT candle to touch line")
+                    self.log(f"🆕  HLINE [{n[:25]}] @ {src:.5f} | 3+3 levels drawn | waiting for NEXT candle to touch line")
 
                 elif obj.is_rectangle:
                     if not obj.rect_valid:
                         self.drawn[n] = "INVALID"
-                        self.log(
-                            f"⚠️  [{n[:25]}] rectangle has zero height — skipping")
+                        self.log(f"⚠️  [{n[:25]}] rectangle has zero height — skipping")
                         continue
                     center = round((obj.rect_top + obj.rect_bottom) / 2, 5)
                     self._draw_hline_levels(n, center, pip)
                     self.drawn[n] = center
-                    source_registry[n] = {"src": center,
-                                          "triggered": False, "gen": 0}
-                    self.log(
-                        f"🆕  RECT [{n[:25]}] center={center:.5f} (h={obj.rect_height:.5f}) | 3+3 levels drawn | waiting for touch")
+                    source_registry[n] = {"src": center, "triggered": False, "gen": 0}
+                    self.log(f"🆕  RECT [{n[:25]}] center={center:.5f} (h={obj.rect_height:.5f}) | 3+3 levels drawn | waiting for touch")
 
             # ── CHECK PREVIOUS CLOSED CANDLE TOUCHES SOURCE LINES ──
             # Use the LAST CLOSED candle (PREV_*) not the forming one.
             # This prevents same-candle buy+sell activation.
-            cur_candle_t = candle.get("CANDLE_T", 0)
+            cur_candle_t  = candle.get("CANDLE_T", 0)
             prev_h = candle.get("PREV_H", 0.0)
             prev_l = candle.get("PREV_L", 0.0)
             prev_c = candle.get("PREV_C", 0.0)
@@ -491,8 +457,7 @@ class WatcherWorker(threading.Thread):
                         self.log(
                             f"🎯  [{n[:20]}] touched @ {src:.5f} {side} | "
                             f"C={prev_c:.5f} → {dir_icon} {direction} bias | placing orders", "NEW")
-                        self._place_orders_for_source(
-                            src, pip, generation=reg["gen"])
+                        self._place_orders_for_source(src, pip, generation=reg["gen"])
                         # Cancel opposite-side orders after 1 scan (give MT5 time to process)
                         reg["cancel_opposite"] = direction
 
@@ -510,8 +475,7 @@ class WatcherWorker(threading.Thread):
                     is_buy_stop = o.type == 2  # ORDER_TYPE_BUY_STOP
                     is_sell_stop = o.type == 4  # ORDER_TYPE_SELL_STOP
                     # If BUY bias → cancel sell-stops. If SELL bias → cancel buy-stops.
-                    should_cancel = (direction == "BUY" and is_sell_stop) or (
-                        direction == "SELL" and is_buy_stop)
+                    should_cancel = (direction == "BUY" and is_sell_stop) or                                     (direction == "SELL" and is_buy_stop)
                     if should_cancel:
                         res = _mt5c.order_send({
                             "action": _mt5c.TRADE_ACTION_REMOVE,
@@ -521,11 +485,13 @@ class WatcherWorker(threading.Thread):
                             cancelled += 1
                 if cancelled > 0:
                     dir_icon = "🟢" if direction == "BUY" else "🔴"
-                    self.log(
-                        f"🗑️  {dir_icon} {direction} bias: cancelled {cancelled} opposite-side orders")
+                    self.log(f"🗑️  {dir_icon} {direction} bias: cancelled {cancelled} opposite-side orders")
 
             # ── PHASE 3: CHECK ACTIVATIONS ───────────────────────────
             self._check_phase3_activations(pip)
+
+            # ── RISK-FREE SL CHECK ────────────────────────────────
+            self.sig.log_line.emit("__CHECK_RF__", "RF")
 
             # ── FOLLOW MOVED OBJECTS ───────────────────────────────
             if self.follow_enabled:
@@ -537,16 +503,13 @@ class WatcherWorker(threading.Thread):
                     if obj.is_hline and isinstance(stored, float):
                         if abs(obj.price1 - stored) > 0.00001:
                             new_src = obj.price1
-                            self.log(
-                                f"↕️  [{n[:25]}] moved {stored:.5f}→{new_src:.5f} — redrawing levels")
+                            self.log(f"↕️  [{n[:25]}] moved {stored:.5f}→{new_src:.5f} — redrawing levels")
                             self._draw_hline_levels(n, new_src, pip)
                             self.drawn[n] = new_src
                             if n in source_registry:
                                 source_registry[n]["src"] = new_src
-                                # reset touch
-                                source_registry[n]["triggered"] = False
-                                # wait for next candle after move
-                                source_registry[n]["registered_at_candle"] = prev_t
+                                source_registry[n]["triggered"] = False  # reset touch
+                                source_registry[n]["registered_at_candle"] = prev_t  # wait for next candle after move
 
             self.prev_names = self.prev_names | cur
             self._stop.wait(SCAN_INTERVAL_SEC)
@@ -572,7 +535,7 @@ class GUI(QMainWindow):
         self.setMinimumSize(1100, 720)
         self.setStyleSheet(SS)
         self._worker: Optional[WatcherWorker] = None
-        self._sig = Sig()
+        self._sig    = Sig()
         self._sig.new_objects.connect(self._on_objects)
         self._sig.status.connect(self._on_status)
         self._sig.log_line.connect(self._on_log)
@@ -582,18 +545,13 @@ class GUI(QMainWindow):
         self._bt_running = False  # guard against double-run
         self._build_ui()
         QTimer.singleShot(100, self._init_mt5_price)
-        self._pt = QTimer()
-        self._pt.timeout.connect(self._refresh_price)
-        self._pt.start(1000)
+        self._pt = QTimer(); self._pt.timeout.connect(self._refresh_price); self._pt.start(1000)
 
     # ─────────────────────────────── UI BUILD ────────────────────
 
     def _build_ui(self):
-        root = QWidget()
-        self.setCentralWidget(root)
-        vl = QVBoxLayout(root)
-        vl.setSpacing(6)
-        vl.setContentsMargins(10, 10, 10, 10)
+        root = QWidget(); self.setCentralWidget(root)
+        vl = QVBoxLayout(root); vl.setSpacing(6); vl.setContentsMargins(10,10,10,10)
         vl.addWidget(self._header())
         spl = QSplitter(Qt.Horizontal)
         spl.addWidget(self._left_panel())
@@ -604,18 +562,13 @@ class GUI(QMainWindow):
 
     def _header(self):
         w = QFrame()
-        w.setStyleSheet(
-            f"background:{C['panel']};border:1px solid {C['border']};border-radius:6px;")
-        hl = QHBoxLayout(w)
-        hl.setContentsMargins(14, 8, 14, 8)
-        t = QLabel(
-            "📈  TraderBot  <span style='color:#4A5568;font-size:10px;'>v1.0</span>")
+        w.setStyleSheet(f"background:{C['panel']};border:1px solid {C['border']};border-radius:6px;")
+        hl = QHBoxLayout(w); hl.setContentsMargins(14,8,14,8)
+        t = QLabel("📈  TraderBot  <span style='color:#4A5568;font-size:10px;'>v1.0</span>")
         t.setStyleSheet(f"color:{C['gold']};font-size:16px;font-weight:bold;")
-        hl.addWidget(t)
-        hl.addStretch()
+        hl.addWidget(t); hl.addStretch()
         self.lbl_price = QLabel("Price: —")
-        self.lbl_price.setStyleSheet(
-            f"color:{C['cyan']};font-family:Consolas;font-size:14px;font-weight:bold;")
+        self.lbl_price.setStyleSheet(f"color:{C['cyan']};font-family:Consolas;font-size:14px;font-weight:bold;")
         hl.addWidget(self.lbl_price)
         hl.addWidget(self._vline())
         self.lbl_sym = QLabel(WATCH_SYMBOL)
@@ -624,8 +577,7 @@ class GUI(QMainWindow):
         hl.addWidget(self._vline())
         self.lbl_ea_chart = QLabel("EA: —")
         self.lbl_ea_chart.setStyleSheet(f"color:{C['txt3']};font-size:10px;")
-        self.lbl_ea_chart.setToolTip(
-            "Which chart the ObjectExporter EA is currently on")
+        self.lbl_ea_chart.setToolTip("Which chart the ObjectExporter EA is currently on")
         hl.addWidget(self.lbl_ea_chart)
         hl.addWidget(self._vline())
         self.lbl_status = QLabel("⚫  Stopped")
@@ -634,33 +586,24 @@ class GUI(QMainWindow):
         hl.addWidget(self._vline())
         # Strategy phase indicator
         self.lbl_phase = QLabel("Phase: —")
-        self.lbl_phase.setStyleSheet(
-            f"color:{C['txt3']};font-size:10px;font-family:Consolas;")
+        self.lbl_phase.setStyleSheet(f"color:{C['txt3']};font-size:10px;font-family:Consolas;")
         hl.addWidget(self.lbl_phase)
         return w
 
     def _left_panel(self):
-        w = QWidget()
-        vl = QVBoxLayout(w)
-        vl.setSpacing(8)
-        vl.setContentsMargins(0, 0, 4, 0)
+        w = QWidget(); vl = QVBoxLayout(w); vl.setSpacing(8); vl.setContentsMargins(0,0,4,0)
 
         # ── Controls ─────────────────────────────────────────────
-        grp = QGroupBox("⚙️  Bot Control")
-        cl = QVBoxLayout(grp)
-        cl.setSpacing(4)
+        grp = QGroupBox("⚙️  Bot Control"); cl = QVBoxLayout(grp); cl.setSpacing(4)
 
         def _lbl(text, tooltip=""):
             l = QLabel(text)
-            l.setStyleSheet(
-                f"color:{C['txt2']};font-size:11px;min-width:90px;")
-            if tooltip:
-                l.setToolTip(tooltip)
+            l.setStyleSheet(f"color:{C['txt2']};font-size:11px;min-width:90px;")
+            if tooltip: l.setToolTip(tooltip)
             return l
 
         def _row(label, widget, tooltip=""):
-            hl = QHBoxLayout()
-            hl.setSpacing(8)
+            hl = QHBoxLayout(); hl.setSpacing(8)
             hl.addWidget(_lbl(label, tooltip))
             widget.setFixedWidth(160)
             hl.addWidget(widget)
@@ -668,38 +611,39 @@ class GUI(QMainWindow):
             cl.addLayout(hl)
 
         # Symbol
-        self.sym_combo = QComboBox()
-        self.sym_combo.setEditable(True)
-        self.sym_combo.addItems(["XAUUSD_i", "EURUSD_i", "GBPUSD_i",
-                                 "XAUUSD", "EURUSD", "GBPUSD", "NAS100", "US30", "BTCUSD"])
+        self.sym_combo = QComboBox(); self.sym_combo.setEditable(True)
+        self.sym_combo.addItems(["XAUUSD_i","EURUSD_i","GBPUSD_i",
+                                  "XAUUSD","EURUSD","GBPUSD","NAS100","US30","BTCUSD"])
         self.sym_combo.setCurrentText(WATCH_SYMBOL)
         self.sym_combo.currentTextChanged.connect(self._on_symbol_changed)
         _row("🎯 Symbol:", self.sym_combo, "The symbol to watch on MT5")
 
         # Pip step
         self.spin_pip = QDoubleSpinBox()
-        self.spin_pip.setRange(0.1, 500.0)
-        self.spin_pip.setSingleStep(1.0)
-        self.spin_pip.setValue(PIP_STEP)
-        self.spin_pip.setDecimals(1)
-        _row("📏 Pip step:", self.spin_pip,
-             "Distance between each level (L1/L2/L3) in pips")
+        self.spin_pip.setRange(0.1, 500.0); self.spin_pip.setSingleStep(1.0)
+        self.spin_pip.setValue(PIP_STEP); self.spin_pip.setDecimals(1)
+        _row("📏 Pip step:", self.spin_pip, "Distance between each level (L1/L2/L3) in pips")
 
-        # TP pips
+        # TP pips with checkbox
+        tp_row = QHBoxLayout(); tp_row.setSpacing(8)
+        self.chk_tp = QCheckBox()
+        self.chk_tp.setChecked(False)
+        self.chk_tp.setToolTip("Enable fixed TP. Unchecked = no TP set (orders run until SL or manual close)")
+        self.chk_tp.setStyleSheet(f"color:{C['txt2']};")
+        tp_row.addWidget(_lbl("🎯 TP pips:"))
+        tp_row.addWidget(self.chk_tp)
         self.spin_tp = QDoubleSpinBox()
-        self.spin_tp.setRange(0, 1000.0)
-        self.spin_tp.setSingleStep(5.0)
-        self.spin_tp.setValue(0)
-        self.spin_tp.setDecimals(1)
-        _row("🎯 TP pips:", self.spin_tp,
-             "Fixed TP from L3 entry in pips (same for all 3 positions)\n0 = use RR ratio")
+        self.spin_tp.setRange(1, 1000.0); self.spin_tp.setSingleStep(5.0)
+        self.spin_tp.setValue(50); self.spin_tp.setDecimals(1)
+        self.spin_tp.setEnabled(False)
+        self.chk_tp.toggled.connect(self.spin_tp.setEnabled)
+        tp_row.addWidget(self.spin_tp); tp_row.addStretch()
+        cl.addLayout(tp_row)
 
         # Lot size
         self.spin_lot = QDoubleSpinBox()
-        self.spin_lot.setRange(0.01, 100.0)
-        self.spin_lot.setSingleStep(0.01)
-        self.spin_lot.setValue(LOT_SIZE)
-        self.spin_lot.setDecimals(2)
+        self.spin_lot.setRange(0.01, 100.0); self.spin_lot.setSingleStep(0.01)
+        self.spin_lot.setValue(LOT_SIZE); self.spin_lot.setDecimals(2)
         _row("📦 Lot size:", self.spin_lot, "Lot size per order")
 
         # Spawn level
@@ -710,10 +654,8 @@ class GUI(QMainWindow):
              "Which activated level spawns a new cascading round")
 
         # Separator
-        sep = QFrame()
-        sep.setFrameShape(QFrame.HLine)
-        sep.setStyleSheet(f"color:{C['border']};")
-        cl.addWidget(sep)
+        sep = QFrame(); sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet(f"color:{C['border']};"); cl.addWidget(sep)
 
         # Start / Stop buttons
         self.btn_start = QPushButton("▶  Start Watcher")
@@ -731,23 +673,18 @@ class GUI(QMainWindow):
 
         self.chk_follow = QCheckBox("🔗  Follow object when moved")
         self.chk_follow.setChecked(True)
-        self.chk_follow.setStyleSheet(
-            f"color:{C['txt2']};font-size:10px;padding:2px 0;")
-        self.chk_follow.setToolTip(
-            "Level lines redraw if you drag the drawn object")
+        self.chk_follow.setStyleSheet(f"color:{C['txt2']};font-size:10px;padding:2px 0;")
+        self.chk_follow.setToolTip("Level lines redraw if you drag the drawn object")
         cl.addWidget(self.chk_follow)
         vl.addWidget(grp)
 
         # ── Strategy summary ─────────────────────────────────────
         grp_strat = QGroupBox("📊  Strategy State")
-        sv = QGridLayout(grp_strat)
-        sv.setSpacing(4)
-        sv.setContentsMargins(8, 6, 8, 6)
+        sv = QGridLayout(grp_strat); sv.setSpacing(4); sv.setContentsMargins(8,6,8,6)
 
         def _stat_label(text, color):
             l = QLabel(text)
-            l.setStyleSheet(
-                f"color:{color};font-family:Consolas;font-size:11px;font-weight:bold;")
+            l.setStyleSheet(f"color:{color};font-family:Consolas;font-size:11px;font-weight:bold;")
             return l
 
         def _stat_key(text):
@@ -756,9 +693,9 @@ class GUI(QMainWindow):
             return l
 
         self.lbl_source_price = _stat_label("—", C['gold'])
-        self.lbl_rounds_info = _stat_label("0 / 9", C['cyan'])
-        self.lbl_waiting = _stat_label("Draw a line on chart", C['txt3'])
-        self.lbl_direction = _stat_label("—", C['txt2'])
+        self.lbl_rounds_info  = _stat_label("0 / 9", C['cyan'])
+        self.lbl_waiting      = _stat_label("Draw a line on chart", C['txt3'])
+        self.lbl_direction    = _stat_label("—", C['txt2'])
 
         sv.addWidget(_stat_key("Source:"),    0, 0)
         sv.addWidget(self.lbl_source_price,   0, 1)
@@ -772,25 +709,46 @@ class GUI(QMainWindow):
         vl.addWidget(grp_strat)
 
         # ── Orders ───────────────────────────────────────────────
-        grp2 = QGroupBox("Live Orders")
-        ol = QVBoxLayout(grp2)
+        grp2 = QGroupBox("Live Orders"); ol = QVBoxLayout(grp2)
         self.btn_place = QPushButton("🎯  Place Buy/Sell Stops")
-        self.btn_place.setObjectName("btn_orders")
-        self.btn_place.setMinimumHeight(34)
-        self.btn_place.setEnabled(False)
-        self.btn_place.clicked.connect(self._place_orders)
+        self.btn_place.setObjectName("btn_orders"); self.btn_place.setMinimumHeight(34)
+        self.btn_place.setEnabled(False); self.btn_place.clicked.connect(self._place_orders)
         ol.addWidget(self.btn_place)
         self.btn_cancel = QPushButton("🗑️  Cancel All Bot Orders")
-        self.btn_cancel.setObjectName("btn_cancel")
-        self.btn_cancel.clicked.connect(self._cancel_orders)
+        self.btn_cancel.setObjectName("btn_cancel"); self.btn_cancel.clicked.connect(self._cancel_orders)
         ol.addWidget(self.btn_cancel)
+
+        # ── Risk-Free section ─────────────────────────────────────
+        grp_rf = QGroupBox("🛡️  Risk-Free Mode")
+        rf_layout = QVBoxLayout(grp_rf); rf_layout.setSpacing(6)
+
+        rf_row1 = QHBoxLayout()
+        rf_row1.addWidget(QLabel("Side to protect:"))
+        self.combo_rf_side = QComboBox()
+        self.combo_rf_side.addItems(["BUY (keep buys)", "SELL (keep sells)"])
+        self.combo_rf_side.setToolTip(
+            "BUY: close all sells + pending, set SL line on buy positions\n"
+            "SELL: close all buys + pending, set SL line on sell positions")
+        rf_row1.addWidget(self.combo_rf_side)
+        rf_layout.addLayout(rf_row1)
+
+        self.btn_rf = QPushButton("🛡️  Activate Risk-Free")
+        self.btn_rf.setObjectName("btn_start")
+        self.btn_rf.setMinimumHeight(32)
+        self.btn_rf.clicked.connect(self._activate_risk_free)
+        rf_layout.addWidget(self.btn_rf)
+
+        self.lbl_rf_status = QLabel("Not active")
+        self.lbl_rf_status.setStyleSheet(f"color:{C['txt3']};font-size:10px;")
+        rf_layout.addWidget(self.lbl_rf_status)
+
+        ol.addWidget(grp_rf)
         vl.addWidget(grp2)
 
         # ── Levels table ─────────────────────────────────────────
-        grp3 = QGroupBox("Detected Levels")
-        ll = QVBoxLayout(grp3)
+        grp3 = QGroupBox("Detected Levels"); ll = QVBoxLayout(grp3)
         self.lvl_tbl = QTableWidget(0, 3)
-        self.lvl_tbl.setHorizontalHeaderLabels(["Level", "Price", "Dist"])
+        self.lvl_tbl.setHorizontalHeaderLabels(["Level","Price","Dist"])
         self.lvl_tbl.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.lvl_tbl.setAlternatingRowColors(True)
         self.lvl_tbl.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -800,59 +758,38 @@ class GUI(QMainWindow):
         return w
 
     def _right_panel(self):
-        w = QWidget()
-        vl = QVBoxLayout(w)
-        vl.setSpacing(0)
-        vl.setContentsMargins(4, 0, 0, 0)
+        w = QWidget(); vl = QVBoxLayout(w); vl.setSpacing(0); vl.setContentsMargins(4,0,0,0)
         self.tabs = QTabWidget()
         self.tabs.addTab(self._tab_log(),       "📋  Log")
         self.tabs.addTab(self._tab_orders(),    "📊  Orders")
-        self.tabs.addTab(self._tab_scoreboard(), "🏆  Scoreboard")
+        self.tabs.addTab(self._tab_scoreboard(),"🏆  Scoreboard")
         self.tabs.addTab(self._tab_backtest(),  "🔬  Backtest")
         vl.addWidget(self.tabs)
         return w
 
     def _tab_log(self):
-        w = QWidget()
-        vl = QVBoxLayout(w)
-        vl.setContentsMargins(4, 4, 4, 4)
-        self.log_view = QTextEdit()
-        self.log_view.setReadOnly(True)
+        w = QWidget(); vl = QVBoxLayout(w); vl.setContentsMargins(4,4,4,4)
+        self.log_view = QTextEdit(); self.log_view.setReadOnly(True)
         self.log_view.setLineWrapMode(QTextEdit.NoWrap)
         vl.addWidget(self.log_view)
-        btn = QPushButton("Clear")
-        btn.setFixedHeight(24)
-        btn.clicked.connect(self.log_view.clear)
-        vl.addWidget(btn)
-        return w
+        btn = QPushButton("Clear"); btn.setFixedHeight(24); btn.clicked.connect(self.log_view.clear)
+        vl.addWidget(btn); return w
 
     def _tab_orders(self):
-        w = QWidget()
-        vl = QVBoxLayout(w)
-        vl.setContentsMargins(6, 6, 6, 6)
-        vl.setSpacing(6)
+        w = QWidget(); vl = QVBoxLayout(w); vl.setContentsMargins(6,6,6,6); vl.setSpacing(6)
 
         # ── Summary bar ───────────────────────────────────────────
-        sum_row = QHBoxLayout()
-        sum_row.setSpacing(8)
+        sum_row = QHBoxLayout(); sum_row.setSpacing(8)
 
         def _mini_card(key, label, color):
             f = QFrame()
-            f.setStyleSheet(
-                f"background:{C['card']};border:1px solid {C['border']};border-radius:6px;")
-            fv = QVBoxLayout(f)
-            fv.setContentsMargins(8, 4, 8, 4)
-            fv.setSpacing(0)
-            lt = QLabel(label)
-            lt.setStyleSheet(
-                f"color:{C['txt3']};font-size:8px;font-weight:bold;")
+            f.setStyleSheet(f"background:{C['card']};border:1px solid {C['border']};border-radius:6px;")
+            fv = QVBoxLayout(f); fv.setContentsMargins(8,4,8,4); fv.setSpacing(0)
+            lt = QLabel(label); lt.setStyleSheet(f"color:{C['txt3']};font-size:8px;font-weight:bold;")
             lt.setAlignment(Qt.AlignCenter)
-            lv = QLabel("—")
-            lv.setStyleSheet(
-                f"color:{color};font-size:15px;font-weight:bold;font-family:Consolas;")
+            lv = QLabel("—"); lv.setStyleSheet(f"color:{color};font-size:15px;font-weight:bold;font-family:Consolas;")
             lv.setAlignment(Qt.AlignCenter)
-            fv.addWidget(lt)
-            fv.addWidget(lv)
+            fv.addWidget(lt); fv.addWidget(lv)
             self._ord_summary[key] = lv
             return f
 
@@ -861,7 +798,7 @@ class GUI(QMainWindow):
         sum_row.addWidget(_mini_card("active",   "ACTIVE",    C['gold']))
         sum_row.addWidget(_mini_card("buy_pos",  "BUY POS",   C['green']))
         sum_row.addWidget(_mini_card("sell_pos", "SELL POS",  C['red']))
-        sum_row.addWidget(_mini_card("total_pnl", "OPEN P&L",  C['purple']))
+        sum_row.addWidget(_mini_card("total_pnl","OPEN P&L",  C['purple']))
         sum_row.addWidget(_mini_card("rounds",   "ROUNDS",    C['txt2']))
         vl.addLayout(sum_row)
 
@@ -870,7 +807,7 @@ class GUI(QMainWindow):
         pv = QVBoxLayout(grp_pending)
         self.ord_pending = QTableWidget(0, 7)
         self.ord_pending.setHorizontalHeaderLabels(
-            ["Gen", "Lvl", "Type", "Entry", "SL", "TP", "Pips SL"])
+            ["Gen","Lvl","Type","Entry","SL","TP","Pips SL"])
         self.ord_pending.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.ord_pending.setAlternatingRowColors(True)
         self.ord_pending.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -884,7 +821,7 @@ class GUI(QMainWindow):
         av = QVBoxLayout(grp_active)
         self.ord_active = QTableWidget(0, 7)
         self.ord_active.setHorizontalHeaderLabels(
-            ["Gen", "Lvl", "Type", "Entry", "SL", "TP", "P&L"])
+            ["Gen","Lvl","Type","Entry","SL","TP","P&L"])
         self.ord_active.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.ord_active.setAlternatingRowColors(True)
         self.ord_active.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -906,32 +843,20 @@ class GUI(QMainWindow):
         return w
 
     def _tab_scoreboard(self):
-        w = QWidget()
-        vl = QVBoxLayout(w)
-        vl.setContentsMargins(8, 8, 8, 8)
-        vl.setSpacing(8)
+        w = QWidget(); vl = QVBoxLayout(w); vl.setContentsMargins(8,8,8,8); vl.setSpacing(8)
 
         # ── Summary cards row ─────────────────────────────────────
-        cards_row = QHBoxLayout()
-        cards_row.setSpacing(6)
+        cards_row = QHBoxLayout(); cards_row.setSpacing(6)
 
         def _card(key, label, color):
             card = QFrame()
-            card.setStyleSheet(
-                f"background:{C['card']};border:1px solid {C['border']};border-radius:8px;")
-            cv = QVBoxLayout(card)
-            cv.setContentsMargins(12, 8, 12, 8)
-            cv.setSpacing(2)
-            lt = QLabel(label)
-            lt.setStyleSheet(
-                f"color:{C['txt3']};font-size:9px;font-weight:bold;letter-spacing:1px;")
+            card.setStyleSheet(f"background:{C['card']};border:1px solid {C['border']};border-radius:8px;")
+            cv = QVBoxLayout(card); cv.setContentsMargins(12,8,12,8); cv.setSpacing(2)
+            lt = QLabel(label); lt.setStyleSheet(f"color:{C['txt3']};font-size:9px;font-weight:bold;letter-spacing:1px;")
             lt.setAlignment(Qt.AlignCenter)
-            lv = QLabel("—")
-            lv.setStyleSheet(
-                f"color:{color};font-size:20px;font-weight:bold;font-family:Consolas;")
+            lv = QLabel("—"); lv.setStyleSheet(f"color:{color};font-size:20px;font-weight:bold;font-family:Consolas;")
             lv.setAlignment(Qt.AlignCenter)
-            cv.addWidget(lt)
-            cv.addWidget(lv)
+            cv.addWidget(lt); cv.addWidget(lv)
             self._sb_cards[key] = lv
             return card
 
@@ -949,7 +874,7 @@ class GUI(QMainWindow):
         hl = QVBoxLayout(grp_hist)
         self.sb_history = QTableWidget(0, 7)
         self.sb_history.setHorizontalHeaderLabels(
-            ["Ticket", "Type", "Entry", "Close", "Pips", "Profit", "Time"])
+            ["Ticket","Type","Entry","Close","Pips","Profit","Time"])
         self.sb_history.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.sb_history.setAlternatingRowColors(True)
         self.sb_history.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -974,23 +899,21 @@ class GUI(QMainWindow):
         """Pull closed deals from MT5 and update scoreboard."""
         try:
             import MetaTrader5 as _mt5
-            if not _mt5.initialize():
-                return
+            if not _mt5.initialize(): return
             _mt5.login(MT5_LOGIN, password=MT5_PASSWORD, server=MT5_SERVER)
 
             acc = _mt5.account_info()
-            if not acc:
-                return
+            if not acc: return
 
             cur_bal = acc.balance
-            equity = acc.equity
+            equity  = acc.equity
 
             # Start balance — store once
             if not hasattr(self, "_start_balance"):
                 self._start_balance = cur_bal
 
             start_bal = self._start_balance
-            pnl = cur_bal - start_bal
+            pnl       = cur_bal - start_bal
 
             # Get closed deals (history) for this magic number
             from datetime import datetime, timezone, timedelta
@@ -1003,16 +926,16 @@ class GUI(QMainWindow):
                     if d.magic == MAGIC_NUMBER and d.entry == 1:  # entry=1 means close/out deal
                         bot_deals.append(d)
 
-            wins = sum(1 for d in bot_deals if d.profit > 0)
+            wins   = sum(1 for d in bot_deals if d.profit > 0)
             losses = sum(1 for d in bot_deals if d.profit < 0)
-            total = wins + losses
-            ratio = f"{wins/total*100:.0f}%" if total > 0 else "—"
+            total  = wins + losses
+            ratio  = f"{wins/total*100:.0f}%" if total > 0 else "—"
 
             # Update cards
             self._sb_cards["start_bal"].setText(f"${start_bal:.2f}")
             self._sb_cards["cur_bal"].setText(f"${cur_bal:.2f}")
             pnl_color = C['green'] if pnl >= 0 else C['red']
-            self._sb_cards["pnl"].setText(f"{'+'if pnl >= 0 else ''}{pnl:.2f}")
+            self._sb_cards["pnl"].setText(f"{'+'if pnl>=0 else ''}{pnl:.2f}")
             self._sb_cards["pnl"].setStyleSheet(
                 f"color:{pnl_color};font-size:20px;font-weight:bold;font-family:Consolas;")
             self._sb_cards["wins"].setText(str(wins))
@@ -1027,11 +950,9 @@ class GUI(QMainWindow):
                 row = self.sb_history.rowCount()
                 self.sb_history.insertRow(row)
                 t = "BUY" if d.type == 0 else "SELL"
-                pips_val = d.profit / \
-                    (LOT_SIZE * pip * 100000) if pip > 0 else 0
+                pips_val = d.profit / (LOT_SIZE * pip * 100000) if pip > 0 else 0
                 clr = QColor(C['green'] if d.profit > 0 else C['red'])
-                close_time = datetime.fromtimestamp(
-                    d.time).strftime("%m-%d %H:%M")
+                close_time = datetime.fromtimestamp(d.time).strftime("%m-%d %H:%M")
                 vals = [str(d.deal), t, f"{d.price:.5f}",
                         f"{d.price:.5f}", f"{pips_val:+.1f}",
                         f"{d.profit:+.2f}", close_time]
@@ -1044,82 +965,54 @@ class GUI(QMainWindow):
             pass  # Scoreboard refresh errors are non-critical
 
     def _tab_backtest(self):
-        w = QWidget()
-        vl = QVBoxLayout(w)
-        vl.setContentsMargins(8, 8, 8, 8)
-        vl.setSpacing(6)
+        w = QWidget(); vl = QVBoxLayout(w); vl.setContentsMargins(8,8,8,8); vl.setSpacing(6)
 
         # ── Settings ──────────────────────────────────────────────
-        grp_set = QGroupBox("Settings")
-        sl = QHBoxLayout(grp_set)
-        sl.setSpacing(10)
+        grp_set = QGroupBox("Settings"); sl = QHBoxLayout(grp_set); sl.setSpacing(10)
         sl.addWidget(QLabel("Symbol:"))
         self.bt_symbol = QComboBox()
         self.bt_symbol.setEditable(True)
-        self.bt_symbol.addItems(
-            [WATCH_SYMBOL, "EURUSD", "GBPUSD", "US30", "NAS100", "XAUUSD"])
+        self.bt_symbol.addItems([WATCH_SYMBOL, "EURUSD", "GBPUSD", "US30", "NAS100", "XAUUSD"])
         self.bt_symbol.setCurrentText(WATCH_SYMBOL)
         self.bt_symbol.setFixedWidth(110)
         sl.addWidget(self.bt_symbol)
         sl.addWidget(QLabel("TF:"))
-        self.bt_tf = QComboBox()
-        self.bt_tf.addItems(["M1", "M5", "M15", "H1", "H4"])
-        self.bt_tf.setCurrentText("M5")
-        sl.addWidget(self.bt_tf)
+        self.bt_tf = QComboBox(); self.bt_tf.addItems(["M1","M5","M15","H1","H4"])
+        self.bt_tf.setCurrentText("M5"); sl.addWidget(self.bt_tf)
         sl.addWidget(QLabel("Days:"))
-        self.bt_days = QSpinBox()
-        self.bt_days.setRange(1, 30)
-        self.bt_days.setValue(5)
+        self.bt_days = QSpinBox(); self.bt_days.setRange(1,30); self.bt_days.setValue(5)
         sl.addWidget(self.bt_days)
         sl.addWidget(QLabel("RR:"))
-        self.bt_rr = QDoubleSpinBox()
-        self.bt_rr.setRange(0.5, 10.0)
-        self.bt_rr.setValue(TP_RR_RATIO)
-        self.bt_rr.setSingleStep(0.5)
-        self.bt_rr.setDecimals(1)
+        self.bt_rr = QDoubleSpinBox(); self.bt_rr.setRange(0.5,10.0)
+        self.bt_rr.setValue(TP_RR_RATIO); self.bt_rr.setSingleStep(0.5); self.bt_rr.setDecimals(1)
         sl.addWidget(self.bt_rr)
         sl.addStretch()
-        self.btn_bt = QPushButton("▶  Run")
-        self.btn_bt.setObjectName("btn_bt")
-        self.btn_bt.setMinimumHeight(30)
-        self.btn_bt.clicked.connect(self._run_backtest)
+        self.btn_bt = QPushButton("▶  Run"); self.btn_bt.setObjectName("btn_bt")
+        self.btn_bt.setMinimumHeight(30); self.btn_bt.clicked.connect(self._run_backtest)
         sl.addWidget(self.btn_bt)
         vl.addWidget(grp_set)
 
         # ── Summary cards ─────────────────────────────────────────
-        grp_sum = QGroupBox("Summary")
-        hs = QHBoxLayout(grp_sum)
+        grp_sum = QGroupBox("Summary"); hs = QHBoxLayout(grp_sum)
         self._bt_cards = {}
         for key, label, color in [
-            ("candles", "Candles", C['txt2']
-             ), ("triggered", "Triggered", C['cyan']),
-            ("wins", "Wins", C['green']), ("losses", "Losses", C['red']),
-            ("winrate", "Win%", C['gold']), ("pips", "Pips", C['purple']),
+            ("candles","Candles",C['txt2']),("triggered","Triggered",C['cyan']),
+            ("wins","Wins",C['green']),("losses","Losses",C['red']),
+            ("winrate","Win%",C['gold']),("pips","Pips",C['purple']),
         ]:
             card = QFrame()
-            card.setStyleSheet(
-                f"background:{C['card']};border:1px solid {C['border']};border-radius:6px;")
-            cv = QVBoxLayout(card)
-            cv.setContentsMargins(8, 4, 8, 4)
-            cv.setSpacing(1)
-            lt = QLabel(label)
-            lt.setStyleSheet(
-                f"color:{C['txt3']};font-size:9px;font-weight:bold;")
-            lv = QLabel("—")
-            lv.setStyleSheet(
-                f"color:{color};font-size:16px;font-weight:bold;font-family:Consolas;")
+            card.setStyleSheet(f"background:{C['card']};border:1px solid {C['border']};border-radius:6px;")
+            cv = QVBoxLayout(card); cv.setContentsMargins(8,4,8,4); cv.setSpacing(1)
+            lt = QLabel(label); lt.setStyleSheet(f"color:{C['txt3']};font-size:9px;font-weight:bold;")
+            lv = QLabel("—"); lv.setStyleSheet(f"color:{color};font-size:16px;font-weight:bold;font-family:Consolas;")
             lv.setAlignment(Qt.AlignCenter)
-            cv.addWidget(lt)
-            cv.addWidget(lv)
-            self._bt_cards[key] = lv
-            hs.addWidget(card)
+            cv.addWidget(lt); cv.addWidget(lv)
+            self._bt_cards[key] = lv; hs.addWidget(card)
         vl.addWidget(grp_sum)
 
         # ── Progress / loading ────────────────────────────────────
-        self.bt_progress = QProgressBar()
-        self.bt_progress.setVisible(False)
-        self.bt_progress.setFixedHeight(6)
-        self.bt_progress.setTextVisible(False)
+        self.bt_progress = QProgressBar(); self.bt_progress.setVisible(False)
+        self.bt_progress.setFixedHeight(6); self.bt_progress.setTextVisible(False)
         vl.addWidget(self.bt_progress)
 
         # ── Candle chart ──────────────────────────────────────────
@@ -1128,26 +1021,22 @@ class GUI(QMainWindow):
 
         # ── Candle replay player ──────────────────────────────────
         grp_replay = QGroupBox("Playback & Orders")
-        rl = QVBoxLayout(grp_replay)
-        rl.setSpacing(4)
+        rl = QVBoxLayout(grp_replay); rl.setSpacing(4)
 
         # Bar info row
         bar_info_row = QHBoxLayout()
         self.bt_bar_lbl = QLabel("Bar: — / —")
-        self.bt_bar_lbl.setStyleSheet(
-            f"color:{C['cyan']};font-family:Consolas;font-size:11px;")
+        self.bt_bar_lbl.setStyleSheet(f"color:{C['cyan']};font-family:Consolas;font-size:11px;")
         bar_info_row.addWidget(self.bt_bar_lbl)
         bar_info_row.addStretch()
         self.bt_price_lbl = QLabel("O:— H:— L:— C:—")
-        self.bt_price_lbl.setStyleSheet(
-            f"color:{C['txt2']};font-family:Consolas;font-size:11px;")
+        self.bt_price_lbl.setStyleSheet(f"color:{C['txt2']};font-family:Consolas;font-size:11px;")
         bar_info_row.addWidget(self.bt_price_lbl)
         rl.addLayout(bar_info_row)
 
         # Slider
         self.bt_slider = QSlider(Qt.Horizontal)
-        self.bt_slider.setMinimum(0)
-        self.bt_slider.setMaximum(0)
+        self.bt_slider.setMinimum(0); self.bt_slider.setMaximum(0)
         self.bt_slider.valueChanged.connect(self._on_bt_slider)
         self.bt_slider.setStyleSheet(f"""
             QSlider::groove:horizontal {{
@@ -1165,41 +1054,28 @@ class GUI(QMainWindow):
 
         # Playback controls
         ctrl_row = QHBoxLayout()
-        self.btn_bt_first = QPushButton("⏮")
-        self.btn_bt_first.setFixedWidth(36)
+        self.btn_bt_first = QPushButton("⏮"); self.btn_bt_first.setFixedWidth(36)
         self.btn_bt_first.clicked.connect(lambda: self.bt_slider.setValue(0))
-        self.btn_bt_prev = QPushButton("◀")
-        self.btn_bt_prev.setFixedWidth(36)
-        self.btn_bt_prev.clicked.connect(
-            lambda: self.bt_slider.setValue(max(0, self.bt_slider.value()-1)))
-        self.btn_bt_play = QPushButton("▶ Play")
-        self.btn_bt_play.setFixedWidth(72)
-        self.btn_bt_play.setCheckable(True)
-        self.btn_bt_play.clicked.connect(self._bt_play_toggle)
-        self.btn_bt_next = QPushButton("▶")
-        self.btn_bt_next.setFixedWidth(36)
-        self.btn_bt_next.clicked.connect(lambda: self.bt_slider.setValue(
-            min(self.bt_slider.maximum(), self.bt_slider.value()+1)))
-        self.btn_bt_last = QPushButton("⏭")
-        self.btn_bt_last.setFixedWidth(36)
-        self.btn_bt_last.clicked.connect(
-            lambda: self.bt_slider.setValue(self.bt_slider.maximum()))
-        self.bt_speed = QComboBox()
-        self.bt_speed.addItems(["0.5×", "1×", "2×", "5×", "10×"])
-        self.bt_speed.setCurrentText("1×")
-        self.bt_speed.setFixedWidth(60)
+        self.btn_bt_prev  = QPushButton("◀"); self.btn_bt_prev.setFixedWidth(36)
+        self.btn_bt_prev.clicked.connect(lambda: self.bt_slider.setValue(max(0, self.bt_slider.value()-1)))
+        self.btn_bt_play  = QPushButton("▶ Play"); self.btn_bt_play.setFixedWidth(72)
+        self.btn_bt_play.setCheckable(True); self.btn_bt_play.clicked.connect(self._bt_play_toggle)
+        self.btn_bt_next  = QPushButton("▶"); self.btn_bt_next.setFixedWidth(36)
+        self.btn_bt_next.clicked.connect(lambda: self.bt_slider.setValue(min(self.bt_slider.maximum(), self.bt_slider.value()+1)))
+        self.btn_bt_last  = QPushButton("⏭"); self.btn_bt_last.setFixedWidth(36)
+        self.btn_bt_last.clicked.connect(lambda: self.bt_slider.setValue(self.bt_slider.maximum()))
+        self.bt_speed = QComboBox(); self.bt_speed.addItems(["0.5×","1×","2×","5×","10×"])
+        self.bt_speed.setCurrentText("1×"); self.bt_speed.setFixedWidth(60)
         for b in [self.btn_bt_first, self.btn_bt_prev, self.btn_bt_play,
                   self.btn_bt_next, self.btn_bt_last]:
             ctrl_row.addWidget(b)
-        ctrl_row.addWidget(QLabel("Speed:"))
-        ctrl_row.addWidget(self.bt_speed)
+        ctrl_row.addWidget(QLabel("Speed:")); ctrl_row.addWidget(self.bt_speed)
         ctrl_row.addStretch()
         rl.addLayout(ctrl_row)
 
         # Order state grid — shows each order's state at current bar
         self.bt_order_grid = QTableWidget(0, 6)
-        self.bt_order_grid.setHorizontalHeaderLabels(
-            ["Gen", "Lvl", "Type", "Entry", "SL/TP", "State"])
+        self.bt_order_grid.setHorizontalHeaderLabels(["Gen","Lvl","Type","Entry","SL/TP","State"])
         self.bt_order_grid.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.bt_order_grid.setAlternatingRowColors(True)
         self.bt_order_grid.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -1218,23 +1094,17 @@ class GUI(QMainWindow):
 
     def _status_bar(self):
         w = QFrame()
-        w.setStyleSheet(
-            f"background:{C['panel']};border:1px solid {C['border']};border-radius:4px;")
-        hl = QHBoxLayout(w)
-        hl.setContentsMargins(10, 4, 10, 4)
+        w.setStyleSheet(f"background:{C['panel']};border:1px solid {C['border']};border-radius:4px;")
+        hl = QHBoxLayout(w); hl.setContentsMargins(10,4,10,4)
         self.lbl_obj_count = QLabel("Objects: —")
         self.lbl_obj_count.setStyleSheet(f"color:{C['txt2']};font-size:10px;")
-        hl.addWidget(self.lbl_obj_count)
-        hl.addStretch()
+        hl.addWidget(self.lbl_obj_count); hl.addStretch()
         self.lbl_auto = QLabel("Auto-hidden: —")
         self.lbl_auto.setStyleSheet(f"color:{C['txt3']};font-size:10px;")
-        hl.addWidget(self.lbl_auto)
-        return w
+        hl.addWidget(self.lbl_auto); return w
 
     def _vline(self):
-        f = QFrame()
-        f.setFrameShape(QFrame.VLine)
-        return f
+        f = QFrame(); f.setFrameShape(QFrame.VLine); return f
 
     # ─────────────────────────────── SLOTS ───────────────────────
 
@@ -1249,80 +1119,67 @@ class GUI(QMainWindow):
     def _start(self):
         self._pip_step = self.spin_pip.value()
         self.spin_pip.setEnabled(False)
-        active_sym = self.sym_combo.currentText().strip() or WATCH_SYMBOL
-        self._tp_pips = self.spin_tp.value()
+        active_sym   = self.sym_combo.currentText().strip() or WATCH_SYMBOL
+        self._tp_pips    = self.spin_tp.value()
         self._spawn_lvls = self.combo_spawn.currentText()
-        self._lot_size = self.spin_lot.value()
+        self._lot_size   = self.spin_lot.value()
         self._worker = WatcherWorker(self._sig, self._pip_step, symbol=active_sym,
-                                     tp_pips=self._tp_pips, spawn_on=self._spawn_lvls,
-                                     lot_size=self._lot_size)
+                                      tp_pips=self._tp_pips, spawn_on=self._spawn_lvls,
+                                      lot_size=self._lot_size)
         self._worker.follow_enabled = self.chk_follow.isChecked()
         self._worker.start()
-        self.btn_start.setEnabled(False)
-        self.btn_stop.setEnabled(True)
+        self.btn_start.setEnabled(False); self.btn_stop.setEnabled(True)
         self.chk_follow.stateChanged.connect(self._toggle_follow)
-        self._on_log(
-            f"{datetime.now().strftime('%H:%M:%S')}  ▶ Watcher started | symbol={active_sym} | pip_step={self._pip_step}", "INFO")
-        self._on_log(
-            f"{datetime.now().strftime('%H:%M:%S')}  💡 Make sure ObjectExporter EA is on the {active_sym} chart in MT5", "INFO")
+        self._on_log(f"{datetime.now().strftime('%H:%M:%S')}  ▶ Watcher started | symbol={active_sym} | pip_step={self._pip_step}", "INFO")
+        self._on_log(f"{datetime.now().strftime('%H:%M:%S')}  💡 Make sure ObjectExporter EA is on the {active_sym} chart in MT5", "INFO")
 
     def _toggle_follow(self, state):
         if self._worker:
             self._worker.follow_enabled = bool(state)
             status = "enabled" if state else "locked"
-            self._on_log(
-                f"{datetime.now().strftime('%H:%M:%S')}  🔗 Follow object: {status}", "INFO")
+            self._on_log(f"{datetime.now().strftime('%H:%M:%S')}  🔗 Follow object: {status}", "INFO")
 
     def _on_symbol_changed(self, sym: str):
         sym = sym.strip()
-        if not sym:
-            return
+        if not sym: return
         # Update header label
         self.lbl_sym.setText(sym)
         # Sync backtest symbol combo
         if hasattr(self, "bt_symbol"):
             self.bt_symbol.setCurrentText(sym)
-        self._on_log(
-            f"{datetime.now().strftime('%H:%M:%S')}  🔄 Symbol changed to {sym}", "INFO")
+        self._on_log(f"{datetime.now().strftime('%H:%M:%S')}  🔄 Symbol changed to {sym}", "INFO")
 
     def _stop(self):
-        if self._worker:
-            self._worker.stop()
-            self._worker = None
-        self.btn_start.setEnabled(True)
-        self.btn_stop.setEnabled(False)
-        self.btn_place.setEnabled(False)
-        self.spin_pip.setEnabled(True)
+        if self._worker: self._worker.stop(); self._worker = None
+        self.btn_start.setEnabled(True); self.btn_stop.setEnabled(False)
+        self.btn_place.setEnabled(False); self.spin_pip.setEnabled(True)
 
     def _place_orders(self):
         if not self.btn_place.isEnabled():
             return  # guard against spurious calls
-        pip = get_pip_size(
-            self.sym_combo.currentText().strip() or WATCH_SYMBOL)
+        pip = get_pip_size(self.sym_combo.currentText().strip() or WATCH_SYMBOL)
         all_orders = []
 
         hlines = [o for o in self._trader_objects if o.is_hline]
-        rects = [o for o in self._trader_objects if o.is_rectangle]
+        rects  = [o for o in self._trader_objects if o.is_rectangle]
 
         if hlines:
             # Hline: 3 buy-stops above, 3 sell-stops below
             _sym = self.sym_combo.currentText().strip() or WATCH_SYMBOL
-            orders = place_level_orders(
-                hlines[0].price1, pip, self._pip_step, _sym)
+            orders = place_level_orders(hlines[0].price1, pip, self._pip_step, _sym)
             all_orders.extend(orders)
 
         elif rects:
             # Rectangle: buy-stops above TOP edge, sell-stops below BOTTOM edge
             rect = next((r for r in rects if r.rect_valid), None)
             if rect is None:
-                self._on_log(
-                    f"{datetime.now().strftime('%H:%M:%S')}  ⚠️  Rectangle not fully drawn yet", "WARN")
+                self._on_log(f"{datetime.now().strftime('%H:%M:%S')}  ⚠️  Rectangle not fully drawn yet", "WARN")
                 return
             step = self._pip_step * pip
-            top = rect.rect_top
+            top    = rect.rect_top
             bottom = rect.rect_bottom
-            above = [top + step * i for i in range(1, 4)]
-            below = [bottom - step * i for i in range(1, 4)]
+            above  = [top    + step * i for i in range(1, 4)]
+            below  = [bottom - step * i for i in range(1, 4)]
             for i in range(3):
                 sl_dist = above[i] - below[i]
                 all_orders.append({
@@ -1341,30 +1198,24 @@ class GUI(QMainWindow):
                 })
 
         if not all_orders:
-            self._on_log(
-                f"{datetime.now().strftime('%H:%M:%S')}  ⚠️  No line or rectangle detected", "WARN")
+            self._on_log(f"{datetime.now().strftime('%H:%M:%S')}  ⚠️  No line or rectangle detected", "WARN")
             return
 
         self.btn_place.setEnabled(False)
         self._populate_ord_table(all_orders)
-        results = send_orders(
-            all_orders, self.sym_combo.currentText().strip() or WATCH_SYMBOL)
-        ok = sum(1 for r in results if r["ok"])
-        failed = [r for r in results if not r["ok"]]
-        ts = datetime.now().strftime('%H:%M:%S')
+        results = send_orders(all_orders, self.sym_combo.currentText().strip() or WATCH_SYMBOL)
+        ok      = sum(1 for r in results if r["ok"])
+        failed  = [r for r in results if not r["ok"]]
+        ts      = datetime.now().strftime('%H:%M:%S')
         if ok == len(results):
             self._on_log(f"{ts}  ✅ All {ok} orders placed successfully", "NEW")
         elif ok > 0:
-            self._on_log(
-                f"{ts}  ⚠️  {ok}/{len(results)} placed — {failed[0].get('reason', 'unknown')}", "WARN")
+            self._on_log(f"{ts}  ⚠️  {ok}/{len(results)} placed — {failed[0].get('reason','unknown')}", "WARN")
         else:
-            reason = failed[0].get(
-                'reason', 'unknown') if failed else 'unknown'
-            self._on_log(
-                f"{ts}  ❌ 0/{len(results)} placed — {reason}", "ERROR")
+            reason = failed[0].get('reason', 'unknown') if failed else 'unknown'
+            self._on_log(f"{ts}  ❌ 0/{len(results)} placed — {reason}", "ERROR")
             if "Market closed" in reason:
-                self._on_log(
-                    f"{ts}  💡 Use the Backtest tab to test while market is closed", "INFO")
+                self._on_log(f"{ts}  💡 Use the Backtest tab to test while market is closed", "INFO")
         self.btn_place.setEnabled(True)
         self.tabs.setCurrentIndex(1)
 
@@ -1372,8 +1223,7 @@ class GUI(QMainWindow):
         """Pull live pending + active orders from MT5 and update the Orders tab."""
         try:
             import MetaTrader5 as _mt5
-            if not _mt5.initialize():
-                return
+            if not _mt5.initialize(): return
             sym = self.sym_combo.currentText().strip() or WATCH_SYMBOL
             pip = get_pip_size(sym)
 
@@ -1383,26 +1233,22 @@ class GUI(QMainWindow):
 
             self.ord_pending.setRowCount(0)
             for o in sorted(bot_pending, key=lambda x: x.price_open):
-                cmt = getattr(o, 'comment', '')
+                cmt  = getattr(o, 'comment', '')
                 # Parse Gen/Lvl from comment e.g. TB_G0L1B
                 gen_str = "?"
                 lvl_str = "?"
                 import re
                 m = re.search(r'G(\d+)L(\d+)', cmt)
-                if m:
-                    gen_str, lvl_str = m.group(1), m.group(2)
+                if m: gen_str, lvl_str = m.group(1), m.group(2)
                 is_buy = o.type == 2  # ORDER_TYPE_BUY_STOP = 2
-                t_str = "BUY_STOP" if is_buy else "SELL_STOP"
-                clr = QColor(C['green'] if is_buy else C['red'])
+                t_str  = "BUY_STOP" if is_buy else "SELL_STOP"
+                clr    = QColor(C['green'] if is_buy else C['red'])
                 sl_pips = abs(o.price_open - o.sl) / pip if pip > 0 else 0
                 row = self.ord_pending.rowCount()
                 self.ord_pending.insertRow(row)
-                gen_colors = [C['gold'], C['cyan'],
-                              C['purple'], C['orange'], C['orange']]
-                try:
-                    gc = QColor(gen_colors[int(gen_str)])
-                except:
-                    gc = QColor(C['txt2'])
+                gen_colors = [C['gold'], C['cyan'], C['purple'], C['orange'], C['orange']]
+                try: gc = QColor(gen_colors[int(gen_str)])
+                except: gc = QColor(C['txt2'])
                 vals = [f"G{gen_str}", f"L{lvl_str}", t_str,
                         f"{o.price_open:.5f}", f"{o.sl:.5f}",
                         f"{o.tp:.5f}" if o.tp > 0 else "—",
@@ -1412,13 +1258,12 @@ class GUI(QMainWindow):
                     it.setForeground(gc if c == 0 else clr)
                     # Highlight L1 rows slightly
                     if lvl_str == "1":
-                        it.setBackground(
-                            QColor("#1A2520" if is_buy else "#251A1A"))
+                        it.setBackground(QColor("#1A2520" if is_buy else "#251A1A"))
                     self.ord_pending.setItem(row, c, it)
 
             # ── Active positions ──────────────────────────────────
             positions = _mt5.positions_get(symbol=sym) or []
-            bot_pos = [p for p in positions if p.magic == MAGIC_NUMBER]
+            bot_pos   = [p for p in positions if p.magic == MAGIC_NUMBER]
 
             self.ord_active.setRowCount(0)
             total_pnl = 0.0
@@ -1428,14 +1273,11 @@ class GUI(QMainWindow):
                 gen_str = lvl_str = "?"
                 import re
                 m = re.search(r'G(\d+)L(\d+)', cmt)
-                if m:
-                    gen_str, lvl_str = m.group(1), m.group(2)
+                if m: gen_str, lvl_str = m.group(1), m.group(2)
                 is_buy = p.type == 0
-                t_str = "BUY" if is_buy else "SELL"
-                if is_buy:
-                    buy_count += 1
-                else:
-                    sell_count += 1
+                t_str  = "BUY" if is_buy else "SELL"
+                if is_buy: buy_count  += 1
+                else:      sell_count += 1
                 total_pnl += p.profit
                 pnl_clr = QColor(C['green'] if p.profit >= 0 else C['red'])
                 row_clr = QColor(C['green'] if is_buy else C['red'])
@@ -1449,12 +1291,9 @@ class GUI(QMainWindow):
                     it = QTableWidgetItem(v)
                     it.setForeground(pnl_clr if c == 6 else row_clr)
                     if c == 0:
-                        gen_colors = [C['gold'], C['cyan'],
-                                      C['purple'], C['orange'], C['orange']]
-                        try:
-                            it.setForeground(QColor(gen_colors[int(gen_str)]))
-                        except:
-                            pass
+                        gen_colors = [C['gold'], C['cyan'], C['purple'], C['orange'], C['orange']]
+                        try: it.setForeground(QColor(gen_colors[int(gen_str)]))
+                        except: pass
                     self.ord_active.setItem(row, c, it)
 
             # ── Summary cards ─────────────────────────────────────
@@ -1467,14 +1306,12 @@ class GUI(QMainWindow):
                 self._ord_summary["total_pnl"].setText(f"{total_pnl:+.2f}")
                 self._ord_summary["total_pnl"].setStyleSheet(
                     f"color:{pnl_color};font-size:15px;font-weight:bold;font-family:Consolas;")
-                rounds = getattr(self._worker, 'spawn_rounds',
-                                 0) if self._worker else 0
+                rounds = getattr(self._worker, 'spawn_rounds', 0) if self._worker else 0
                 self._ord_summary["rounds"].setText(str(rounds))
 
             # ── Tab title with count ──────────────────────────────
             total = len(bot_pending) + len(bot_pos)
-            self.tabs.setTabText(
-                1, f"📊  Orders ({total})" if total else "📊  Orders")
+            self.tabs.setTabText(1, f"📊  Orders ({total})" if total else "📊  Orders")
             # Update group box titles with counts
             self.ord_pending.parent().parent().setTitle(
                 f"🔵  Pending Orders ({len(bot_pending)})")
@@ -1484,8 +1321,143 @@ class GUI(QMainWindow):
         except Exception as e:
             pass  # Non-critical refresh failure
 
+    def _activate_risk_free(self):
+        """
+        Risk-Free mode:
+        1. Determine which side to KEEP (BUY or SELL)
+        2. Close all positions on the OPPOSITE side
+        3. Cancel ALL pending orders
+        4. Draw a horizontal line on chart labeled "TB_RF_SL"
+        5. Every scan cycle: if price touches that line → close all kept positions
+        """
+        import MetaTrader5 as _mt5
+        sym = self.sym_combo.currentText().strip() or WATCH_SYMBOL
+        keep_side = "BUY" if "BUY" in self.combo_rf_side.currentText() else "SELL"
+        close_side = "SELL" if keep_side == "BUY" else "BUY"
+
+        positions = _mt5.positions_get(symbol=sym) or []
+        bot_pos = [p for p in positions if p.magic == MAGIC_NUMBER]
+
+        keep_pos  = [p for p in bot_pos if (p.type == 0) == (keep_side == "BUY")]
+        close_pos = [p for p in bot_pos if (p.type == 0) != (keep_side == "BUY")]
+
+        if not keep_pos:
+            self._on_log(f"{datetime.now().strftime('%H:%M:%S')}  ⚠️  No {keep_side} positions to protect", "WARN")
+            return
+
+        # Close opposite side
+        closed = 0
+        for p in close_pos:
+            close_type = _mt5.ORDER_TYPE_SELL if p.type == 0 else _mt5.ORDER_TYPE_BUY
+            tick = _mt5.symbol_info_tick(sym)
+            price = tick.bid if close_type == _mt5.ORDER_TYPE_SELL else tick.ask
+            req = {
+                "action":       _mt5.TRADE_ACTION_DEAL,
+                "symbol":       sym,
+                "volume":       p.volume,
+                "type":         close_type,
+                "position":     p.ticket,
+                "price":        price,
+                "deviation":    20,
+                "magic":        MAGIC_NUMBER,
+                "comment":      "TB_RF_CLOSE",
+                "type_time":    _mt5.ORDER_TIME_GTC,
+                "type_filling": _mt5.ORDER_FILLING_RETURN,
+            }
+            res = _mt5.order_send(req)
+            if res and res.retcode == _mt5.TRADE_RETCODE_DONE:
+                closed += 1
+
+        # Cancel all pending
+        pending = _mt5.orders_get(symbol=sym) or []
+        cancelled = 0
+        for o in pending:
+            if o.magic == MAGIC_NUMBER:
+                res = _mt5.order_send({"action": _mt5.TRADE_ACTION_REMOVE, "order": o.ticket})
+                if res and res.retcode == _mt5.TRADE_RETCODE_DONE:
+                    cancelled += 1
+
+        # Draw RF SL line at average entry of kept positions
+        avg_entry = sum(p.price_open for p in keep_pos) / len(keep_pos)
+        write_commands([f"DRAW_HLINE|TB_RF_SL|{avg_entry:.5f}|{0xFFD700}|2|0"], symbol=sym)
+
+        # Store RF state for watcher to monitor
+        self._rf_active    = True
+        self._rf_keep_side = keep_side
+        self._rf_sym       = sym
+        self._rf_tickets   = [p.ticket for p in keep_pos]
+
+        n_keep = len(keep_pos)
+        ts = datetime.now().strftime("%H:%M:%S")
+        self._on_log(
+            f"{ts}  🛡️  Risk-Free ACTIVE — keeping {n_keep} {keep_side} positions | "
+            f"closed {closed} {close_side} | cancelled {cancelled} pending | "
+            f"SL line at {avg_entry:.5f} (drag to adjust)", "NEW")
+        self.lbl_rf_status.setText(
+            f"Active: {n_keep} {keep_side} positions | SL @ {avg_entry:.5f}")
+        self.lbl_rf_status.setStyleSheet(f"color:{C['green']};font-size:10px;font-weight:bold;")
+
+    def _check_rf_sl(self, candle: dict):
+        """Called each scan cycle when RF mode is active. Closes all kept positions if SL line is touched."""
+        if not getattr(self, "_rf_active", False):
+            return
+        import MetaTrader5 as _mt5
+        sym  = self._rf_sym
+        prev_h = candle.get("PREV_H", 0.0)
+        prev_l = candle.get("PREV_L", 0.0)
+
+        # Find RF SL line price from MT5 objects
+        # Parse it from the file or get from objects
+        # Use BID as fallback
+        tick = _mt5.symbol_info_tick(sym)
+        if not tick:
+            return
+
+        # Look for TB_RF_SL in trader objects
+        rf_price = None
+        for obj in self._trader_objects:
+            if obj.name == "TB_RF_SL" and obj.is_hline:
+                rf_price = obj.price1
+                break
+
+        if rf_price is None:
+            return
+
+        # Check if previous closed candle touched the RF SL line
+        if prev_l <= rf_price <= prev_h:
+            # Close all kept positions
+            positions = _mt5.positions_get(symbol=sym) or []
+            closed = 0
+            for p in positions:
+                if p.magic == MAGIC_NUMBER:
+                    keep = self._rf_keep_side
+                    if (p.type == 0) == (keep == "BUY"):
+                        close_type = _mt5.ORDER_TYPE_SELL if p.type == 0 else _mt5.ORDER_TYPE_BUY
+                        tick2 = _mt5.symbol_info_tick(sym)
+                        price = tick2.bid if close_type == _mt5.ORDER_TYPE_SELL else tick2.ask
+                        req = {
+                            "action": _mt5.TRADE_ACTION_DEAL, "symbol": sym,
+                            "volume": p.volume, "type": close_type,
+                            "position": p.ticket, "price": price,
+                            "deviation": 20, "magic": MAGIC_NUMBER,
+                            "comment": "TB_RF_EXIT",
+                            "type_time": _mt5.ORDER_TIME_GTC,
+                            "type_filling": _mt5.ORDER_FILLING_RETURN,
+                        }
+                        res = _mt5.order_send(req)
+                        if res and res.retcode == _mt5.TRADE_RETCODE_DONE:
+                            closed += 1
+
+            ts = datetime.now().strftime("%H:%M:%S")
+            self._on_log(
+                f"{ts}  🛡️  Risk-Free SL hit @ {rf_price:.5f} | "
+                f"closed {closed} {self._rf_keep_side} positions with profit", "NEW")
+            self._rf_active = False
+            self.lbl_rf_status.setText("Triggered — all positions closed")
+            self.lbl_rf_status.setStyleSheet(f"color:{C['cyan']};font-size:10px;")
+            write_commands(["DELETE|TB_RF_SL"], symbol=sym)
+
     def _cancel_orders(self):
-        # Guard against multiple rapid calls
         if getattr(self, "_cancelling", False):
             return
         self._cancelling = True
@@ -1493,9 +1465,9 @@ class GUI(QMainWindow):
             sym = self.sym_combo.currentText().strip() or WATCH_SYMBOL
             n = cancel_all_tb_orders(sym)
             write_commands(["DELETE_PREFIX|TB_"], symbol=sym)
-            self._on_log(
-                f"{datetime.now().strftime('%H:%M:%S')}  🗑️  Cancelled {n} bot orders + cleared all level lines", "WARN")
-            self.ord_tbl.setRowCount(0)
+            self._on_log(f"{datetime.now().strftime('%H:%M:%S')}  🗑️  Cancelled {n} bot orders + cleared all level lines", "WARN")
+            if hasattr(self, 'ord_pending'): self.ord_pending.setRowCount(0)
+            if hasattr(self, 'ord_active'):  self.ord_active.setRowCount(0)
         finally:
             self._cancelling = False
 
@@ -1503,10 +1475,9 @@ class GUI(QMainWindow):
         if self._bt_running:
             return  # already running
         hlines = [o for o in self._trader_objects if o.is_hline]
-        rects = [o for o in self._trader_objects if o.is_rectangle and o.rect_valid]
+        rects  = [o for o in self._trader_objects if o.is_rectangle and o.rect_valid]
         if not hlines and not rects:
-            self._on_log(
-                f"{datetime.now().strftime('%H:%M:%S')}  ⚠️  Draw a line or rectangle on your chart first", "WARN")
+            self._on_log(f"{datetime.now().strftime('%H:%M:%S')}  ⚠️  Draw a line or rectangle on your chart first", "WARN")
             return
 
         # Warn if pip step might be below broker minimum
@@ -1514,21 +1485,17 @@ class GUI(QMainWindow):
         ts = datetime.now().strftime('%H:%M:%S')
         self._on_log(f"{ts}  🔬 Running backtest on {sym_for_check}...", "BT")
         self._bt_running = True
-        self.btn_bt.setEnabled(False)
-        self.btn_bt.setText("Loading…")
-        self.bt_progress.setVisible(True)
-        self.bt_progress.setRange(0, 0)
+        self.btn_bt.setEnabled(False); self.btn_bt.setText("Loading…")
+        self.bt_progress.setVisible(True); self.bt_progress.setRange(0, 0)
         self._bt_play_timer.stop()
-        self.btn_bt_play.setChecked(False)
-        self.btn_bt_play.setText("▶ Play")
+        self.btn_bt_play.setChecked(False); self.btn_bt_play.setText("▶ Play")
 
-        bt_sym = self.bt_symbol.currentText().strip(
-        ) or self.sym_combo.currentText().strip() or WATCH_SYMBOL
-        pip = get_pip_size(bt_sym)
+        bt_sym   = self.bt_symbol.currentText().strip() or self.sym_combo.currentText().strip() or WATCH_SYMBOL
+        pip      = get_pip_size(bt_sym)
         pip_step = self._pip_step
-        tf = self.bt_tf.currentText()
-        days = self.bt_days.value()
-        rr = self.bt_rr.value()
+        tf       = self.bt_tf.currentText()
+        days     = self.bt_days.value()
+        rr       = self.bt_rr.value()
 
         use_hline = bool(hlines)
         if use_hline:
@@ -1536,20 +1503,19 @@ class GUI(QMainWindow):
             rect_top = rect_bot = None
         else:
             rect = rects[0]
-            src = rect.price1
-            rect_top = rect.rect_top
-            rect_bot = rect.rect_bottom
+            src  = rect.price1
+            rect_top = rect.rect_top; rect_bot = rect.rect_bottom
 
         # Capture all values for the thread closure
-        _sym = bt_sym
-        _tf = tf
-        _src = src
-        _step = pip_step
-        _rr = rr
-        _days = days
-        _hline = use_hline
-        _rtop = rect_top
-        _rbot = rect_bot
+        _sym      = bt_sym
+        _tf       = tf
+        _src      = src
+        _step     = pip_step
+        _rr       = rr
+        _days     = days
+        _hline    = use_hline
+        _rtop     = rect_top
+        _rbot     = rect_bot
 
         def _run():
             import traceback as _tb
@@ -1601,56 +1567,44 @@ class GUI(QMainWindow):
 
     def _update_strategy_state(self, trader):
         hlines = [o for o in trader if o.is_hline]
-        rects = [o for o in trader if o.is_rectangle and o.rect_valid]
-        rounds = getattr(self._worker, 'spawn_rounds',
-                         0) if self._worker else 0
-        pending_count = len(
-            getattr(self._worker, 'pending_tracker', {})) if self._worker else 0
+        rects  = [o for o in trader if o.is_rectangle and o.rect_valid]
+        rounds = getattr(self._worker, 'spawn_rounds', 0) if self._worker else 0
+        pending_count = len(getattr(self._worker, 'pending_tracker', {})) if self._worker else 0
 
         if hlines or rects:
             obj = hlines[0] if hlines else rects[0]
-            src = obj.price1 if obj.is_hline else round(
-                (obj.rect_top+obj.rect_bottom)/2, 5)
+            src = obj.price1 if obj.is_hline else round((obj.rect_top+obj.rect_bottom)/2,5)
             self.lbl_source_price.setText(f"{src:.5f}")
-            direction = getattr(self._worker, '_last_direction',
-                                '—') if self._worker else '—'
+            direction = getattr(self._worker, '_last_direction', '—') if self._worker else '—'
             if direction == 'BUY':
                 self.lbl_direction.setText("🟢 BUY bias")
-                self.lbl_direction.setStyleSheet(
-                    f"color:{C['green']};font-family:Consolas;font-size:11px;font-weight:bold;")
+                self.lbl_direction.setStyleSheet(f"color:{C['green']};font-family:Consolas;font-size:11px;font-weight:bold;")
             elif direction == 'SELL':
                 self.lbl_direction.setText("🔴 SELL bias")
-                self.lbl_direction.setStyleSheet(
-                    f"color:{C['red']};font-family:Consolas;font-size:11px;font-weight:bold;")
+                self.lbl_direction.setStyleSheet(f"color:{C['red']};font-family:Consolas;font-size:11px;font-weight:bold;")
             else:
                 self.lbl_direction.setText("— waiting")
-                self.lbl_direction.setStyleSheet(
-                    f"color:{C['txt3']};font-family:Consolas;font-size:11px;")
+                self.lbl_direction.setStyleSheet(f"color:{C['txt3']};font-family:Consolas;font-size:11px;")
             triggered = any(
                 v.get("triggered", False)
                 for v in (getattr(self._worker, 'source_registry', {}) or {}).values()
             ) if self._worker and hasattr(self._worker, 'source_registry') else False
             if triggered:
                 self.lbl_waiting.setText(f"✅ Active — {pending_count} pending")
-                self.lbl_waiting.setStyleSheet(
-                    f"color:{C['green']};font-family:Consolas;font-size:11px;font-weight:bold;")
+                self.lbl_waiting.setStyleSheet(f"color:{C['green']};font-family:Consolas;font-size:11px;font-weight:bold;")
             else:
                 self.lbl_waiting.setText("⏳ Waiting for touch")
-                self.lbl_waiting.setStyleSheet(
-                    f"color:{C['orange']};font-family:Consolas;font-size:11px;")
+                self.lbl_waiting.setStyleSheet(f"color:{C['orange']};font-family:Consolas;font-size:11px;")
         else:
             self.lbl_source_price.setText("—")
             self.lbl_direction.setText("—")
-            self.lbl_direction.setStyleSheet(
-                f"color:{C['txt3']};font-family:Consolas;font-size:11px;")
+            self.lbl_direction.setStyleSheet(f"color:{C['txt3']};font-family:Consolas;font-size:11px;")
             self.lbl_waiting.setText("Draw a line on chart")
-            self.lbl_waiting.setStyleSheet(
-                f"color:{C['txt3']};font-family:Consolas;font-size:11px;")
+            self.lbl_waiting.setStyleSheet(f"color:{C['txt3']};font-family:Consolas;font-size:11px;")
 
         self.lbl_rounds_info.setText(f"Rounds: {rounds}/9")
         color = C['red'] if rounds >= 7 else C['gold'] if rounds >= 4 else C['cyan']
-        self.lbl_rounds_info.setStyleSheet(
-            f"color:{color};font-family:Consolas;font-size:11px;")
+        self.lbl_rounds_info.setStyleSheet(f"color:{color};font-family:Consolas;font-size:11px;")
         self.lbl_phase.setText(f"G{rounds} | Pending: {pending_count}")
 
     def _on_status(self, msg):
@@ -1659,25 +1613,27 @@ class GUI(QMainWindow):
         self.lbl_status.setStyleSheet(f"color:{color};font-size:11px;")
 
     def _on_log(self, msg, level="INFO"):
-        if msg == "__BT_RESULT__":
-            return
+        if msg == "__BT_RESULT__": return
         if msg == "__REFRESH_ORDERS__":
             self._refresh_orders_tab()
+            return
+        if msg.startswith("__CANDLE__"):
+            try: self._last_candle = eval(msg[9:])
+            except: pass
+            return
+        if msg == "__CHECK_RF__":
+            self._check_rf_sl(getattr(self, "_last_candle", {}))
             return
         if msg.startswith("__EA_SYM__"):
             ea_sym = msg[10:]
             self.lbl_ea_chart.setText(f"EA: {ea_sym}")
             active_sym = self.sym_combo.currentText().strip()
             if ea_sym != active_sym:
-                self.lbl_ea_chart.setStyleSheet(
-                    f"color:{C['orange']};font-size:10px;font-weight:bold;")
-                self.lbl_ea_chart.setToolTip(
-                    f"⚠️ EA is on {ea_sym} but you want {active_sym}. Drag ObjectExporter to {active_sym} chart.")
+                self.lbl_ea_chart.setStyleSheet(f"color:{C['orange']};font-size:10px;font-weight:bold;")
+                self.lbl_ea_chart.setToolTip(f"⚠️ EA is on {ea_sym} but you want {active_sym}. Drag ObjectExporter to {active_sym} chart.")
             else:
-                self.lbl_ea_chart.setStyleSheet(
-                    f"color:{C['green']};font-size:10px;")
-                self.lbl_ea_chart.setToolTip(
-                    f"EA is on the correct chart: {ea_sym}")
+                self.lbl_ea_chart.setStyleSheet(f"color:{C['green']};font-size:10px;")
+                self.lbl_ea_chart.setToolTip(f"EA is on the correct chart: {ea_sym}")
             return
         clr = {
             "NEW": C['green'], "WARN": C['orange'],
@@ -1690,30 +1646,26 @@ class GUI(QMainWindow):
 
     def _refresh_price(self):
         try:
-            sym = self.sym_combo.currentText().strip() if hasattr(
-                self, 'sym_combo') else WATCH_SYMBOL
+            sym  = self.sym_combo.currentText().strip() if hasattr(self,'sym_combo') else WATCH_SYMBOL
             tick = mt5.symbol_info_tick(sym)
             if tick:
                 p = (tick.bid + tick.ask) / 2
                 self.lbl_price.setText(f"Price: {p:.5f}")
-        except Exception:
-            pass
+        except Exception: pass
 
     def _populate_lvl_table(self, trader):
-        sym = self.sym_combo.currentText().strip() if hasattr(
-            self, 'sym_combo') else WATCH_SYMBOL
-        pip = get_pip_size(sym)
+        sym  = self.sym_combo.currentText().strip() if hasattr(self,'sym_combo') else WATCH_SYMBOL
+        pip  = get_pip_size(sym)
         step = self._pip_step * pip
         self.lvl_tbl.setRowCount(0)
         try:
             tick = mt5.symbol_info_tick(sym)
-            cur = (tick.bid + tick.ask) / 2 if tick else 0
-        except:
-            cur = 0
+            cur  = (tick.bid + tick.ask) / 2 if tick else 0
+        except: cur = 0
 
         hlines = [o for o in trader if o.is_hline]
-        rects = [o for o in trader if o.is_rectangle]
-        rows = []
+        rects  = [o for o in trader if o.is_rectangle]
+        rows   = []
 
         if hlines:
             src = hlines[0].price1
@@ -1725,37 +1677,31 @@ class GUI(QMainWindow):
 
         elif rects:
             rect = next((r for r in rects if r.rect_valid), None)
-            if rect is None:
-                return
-            top = rect.rect_top
-            bot = rect.rect_bottom
+            if rect is None: return
+            top = rect.rect_top; bot = rect.rect_bottom
             for i in range(3, 0, -1):
                 rows.append((f"🟠 Above {i}", top + step*i, C['orange']))
             rows.append((f"── TOP  {top:.5f}", top, C['gold']))
-            rows.append(
-                (f"── ZONE ({'%.5f' % (top - bot)})", (top+bot)/2, C['txt3']))
+            rows.append((f"── ZONE ({'%.5f' % (top - bot)})", (top+bot)/2, C['txt3']))
             rows.append((f"── BOT  {bot:.5f}", bot, C['gold']))
             for i in range(1, 4):
                 rows.append((f"🟢 Below {i}", bot - step*i, C['green']))
 
-        if not rows:
-            return
+        if not rows: return
         self.lvl_tbl.setRowCount(len(rows))
         for r, (lbl, price, clr) in enumerate(rows):
-            dist = f"{'+' if price-cur >= 0 else ''}{price-cur:.2f}" if cur else "—"
+            dist  = f"{'+' if price-cur >= 0 else ''}{price-cur:.2f}" if cur else "—"
             for c, v in enumerate([lbl, f"{price:.5f}", dist]):
-                it = QTableWidgetItem(v)
-                it.setForeground(QColor(clr))
+                it = QTableWidgetItem(v); it.setForeground(QColor(clr))
                 self.lvl_tbl.setItem(r, c, it)
 
     def _populate_ord_table(self, orders):
-        self.ord_tbl.setRowCount(len(orders))
+        self.ord_pending.setRowCount(len(orders))
         for r, o in enumerate(orders):
             clr = QColor(C['green'] if o["type"] == "BUY_STOP" else C['red'])
             for c, v in enumerate([f"L{o['level']}", o["type"],
-                                   f"{o['entry']:.5f}", f"{o['sl']:.5f}", f"{o['tp']:.5f}"]):
-                it = QTableWidgetItem(v)
-                it.setForeground(clr)
+                                    f"{o['entry']:.5f}", f"{o['sl']:.5f}", f"{o['tp']:.5f}"]):
+                it = QTableWidgetItem(v); it.setForeground(clr)
                 self.ord_tbl.setItem(r, c, it)
 
     def _display_bt_result(self):
@@ -1768,15 +1714,12 @@ class GUI(QMainWindow):
         except Exception:
             return
         if not hasattr(self, '_bt_result') or self._bt_result is None:
-            err = getattr(self, '_run_err',
-                          None) or 'Unknown error — check log'
-            self._on_log(
-                f"{datetime.now().strftime('%H:%M:%S')}  ❌ Backtest failed: {err}", "ERROR")
+            err = getattr(self, '_run_err', None) or 'Unknown error — check log'
+            self._on_log(f"{datetime.now().strftime('%H:%M:%S')}  ❌ Backtest failed: {err}", "ERROR")
             return
         r = self._bt_result
         if r.candles_used == 0:
-            self._on_log(
-                f"{datetime.now().strftime('%H:%M:%S')}  ❌ No candles returned — check symbol name and MT5 connection", "ERROR")
+            self._on_log(f"{datetime.now().strftime('%H:%M:%S')}  ❌ No candles returned — check symbol name and MT5 connection", "ERROR")
             return
 
         # Summary cards
@@ -1803,8 +1746,7 @@ class GUI(QMainWindow):
 
         self.tabs.setCurrentIndex(2)
         ts = datetime.now().strftime('%H:%M:%S')
-        self._on_log(
-            f"{ts}  🔬 {r.candles_used} bars | W:{len(r.wins)} L:{len(r.losses)} | {pp:+.1f} pips", "BT")
+        self._on_log(f"{ts}  🔬 {r.candles_used} bars | W:{len(r.wins)} L:{len(r.losses)} | {pp:+.1f} pips", "BT")
 
     def _on_bt_slider(self, value: int):
         if 0 <= value < len(self._bt_snapshots):
@@ -1839,15 +1781,11 @@ class GUI(QMainWindow):
                 "SL":        C['red'],
                 "OPEN":      C['blue'],
             }.get(state, C['txt2'])
-            dir_clr = QColor(C['green'] if direction ==
-                             "BUY_STOP" else C['red'])
-            emoji = {"PENDING": "⏳", "TRIGGERED": "🔵", "TP": "✅",
-                     "SL": "❌", "OPEN": "🔵"}.get(state, "?")
-            entry_touched = (direction == "BUY_STOP" and bar_high >= o["entry"]) or (
-                direction == "SELL_STOP" and bar_low <= o["entry"])
+            dir_clr = QColor(C['green'] if direction == "BUY_STOP" else C['red'])
+            emoji = {"PENDING":"⏳","TRIGGERED":"🔵","TP":"✅","SL":"❌","OPEN":"🔵"}.get(state,"?")
+            entry_touched = (direction == "BUY_STOP"  and bar_high >= o["entry"]) or                             (direction == "SELL_STOP" and bar_low  <= o["entry"])
             sl_tp_str = f"SL {o['sl']:.5f} / TP {o['tp']:.5f}"
-            gen_colors = ["#F5A623", "#00BCD4",
-                          "#B388FF", "#FF8C00", "#00FF88"]
+            gen_colors = ["#F5A623","#00BCD4","#B388FF","#FF8C00","#00FF88"]
             gen_clr_str = gen_colors[min(o["generation"], len(gen_colors)-1)]
             vals = [f"G{o['generation']}", f"L{o['level']}", direction,
                     f"{o['entry']:.5f}", sl_tp_str, f"{emoji} {state}"]
@@ -1883,17 +1821,13 @@ class GUI(QMainWindow):
             self.bt_slider.setValue(nxt)
 
     def closeEvent(self, e):
-        self._stop()
-        e.accept()
+        self._stop(); e.accept()
 
 
 def main():
-    app = QApplication(sys.argv)
-    app.setStyle("Fusion")
-    win = GUI()
-    win.show()
+    app = QApplication(sys.argv); app.setStyle("Fusion")
+    win = GUI(); win.show()
     sys.exit(app.exec_())
-
 
 if __name__ == "__main__":
     main()

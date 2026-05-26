@@ -23,14 +23,12 @@ ORDER LOGIC:
     MT5 requires minimum stop distance. We fetch the symbol's STOPLEVEL
     and ensure SL is at least that far from entry.
 """
-from config import LOT_SIZE, TP_RR_RATIO, MAGIC_NUMBER
-import MetaTrader5 as mt5
-import logging
-import sys
-import os as _os
-sys.path.insert(0, _os.path.dirname(
-    _os.path.dirname(_os.path.abspath(__file__))))
+import sys, os as _os
+sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 
+import logging
+import MetaTrader5 as mt5
+from config import LOT_SIZE, TP_RR_RATIO, MAGIC_NUMBER
 
 log = logging.getLogger("orders")
 
@@ -42,12 +40,9 @@ def _filling_mode(symbol: str) -> int:
     if info is None:
         return mt5.ORDER_FILLING_RETURN
     m = info.filling_mode
-    if m & 4:
-        return mt5.ORDER_FILLING_RETURN
-    if m & 2:
-        return mt5.ORDER_FILLING_IOC
-    if m & 1:
-        return mt5.ORDER_FILLING_FOK
+    if m & 4: return mt5.ORDER_FILLING_RETURN
+    if m & 2: return mt5.ORDER_FILLING_IOC
+    if m & 1: return mt5.ORDER_FILLING_FOK
     return mt5.ORDER_FILLING_RETURN
 
 
@@ -103,58 +98,54 @@ def _adjust_tp(entry: float, tp: float, symbol: str, is_buy: bool) -> float:
 def build_level_orders(source_price: float, pip_size: float,
                        pip_step: float, symbol: str,
                        generation: int = 0,
-                       comment_prefix: str = "TB") -> list:
+                       comment_prefix: str = "TB",
+                       tp_pips: float = 0.0) -> list:
     """
-    Build 6 order dicts (not yet sent) for a source line.
-    Returns list of order parameter dicts.
+    Build 6 order dicts for a source line.
+    tp_pips > 0: all 3 buy positions share TP = L3_buy_entry + tp_pips,
+                 all 3 sell positions share TP = L3_sell_entry - tp_pips.
+    tp_pips = 0: use TP_RR_RATIO per position.
     """
     step = pip_step * pip_size
-    above = [_round_price(source_price + step * i, symbol)
-             for i in range(1, 4)]
-    below = [_round_price(source_price - step * i, symbol)
-             for i in range(1, 4)]
+    above = [_round_price(source_price + step * i, symbol) for i in range(1, 4)]
+    below = [_round_price(source_price - step * i, symbol) for i in range(1, 4)]
 
-    min_dist = _min_stop_distance(symbol)
+    # Fixed TP: same TP price for all 3 positions in the round
+    fixed_tp_buy = fixed_tp_sell = None
+    if tp_pips > 0:
+        tp_dist = tp_pips * pip_size
+        fixed_tp_buy  = _round_price(above[2] + tp_dist, symbol)  # L3 entry + tp_pips
+        fixed_tp_sell = _round_price(below[2] - tp_dist, symbol)  # L3 entry - tp_pips
+        log.info("Fixed TP: BUY_TP=%.5f SELL_TP=%.5f (%g pips from L3)",
+                 fixed_tp_buy, fixed_tp_sell, tp_pips)
+
     orders = []
     for i in range(3):
         lvl = i + 1
-        ea = above[i]
-        es = below[i]
+        ea  = above[i]
+        es  = below[i]
 
-        # SL = mirror level. If distance < min_stop, push SL further out.
-        # Keep entry fixed — only adjust SL (and TP proportionally).
-        sl_buy_raw = es   # mirror: buy SL = below level
-        sl_sell_raw = ea   # mirror: sell SL = above level
+        sl_buy  = _adjust_sl(ea, es, symbol, True)
+        sl_sell = _adjust_sl(es, ea, symbol, False)
+        dist_b  = ea - sl_buy
+        dist_s  = sl_sell - es
 
-        sl_buy = _adjust_sl(ea, sl_buy_raw,  symbol, True)
-        sl_sell = _adjust_sl(es, sl_sell_raw, symbol, False)
-
-        dist_b = ea - sl_buy
-        dist_s = sl_sell - es
-        tp_buy = _adjust_tp(ea, _round_price(
-            ea + dist_b * TP_RR_RATIO, symbol), symbol, True)
-        tp_sell = _adjust_tp(es, _round_price(
-            es - dist_s * TP_RR_RATIO, symbol), symbol, False)
+        if fixed_tp_buy is not None:
+            tp_buy  = _adjust_tp(ea, fixed_tp_buy,  symbol, True)
+            tp_sell = _adjust_tp(es, fixed_tp_sell, symbol, False)
+        else:
+            tp_buy  = _adjust_tp(ea, _round_price(ea + dist_b * TP_RR_RATIO, symbol), symbol, True)
+            tp_sell = _adjust_tp(es, _round_price(es - dist_s * TP_RR_RATIO, symbol), symbol, False)
 
         orders.append({
-            "level":      lvl,
-            "generation": generation,
-            "source":     source_price,
-            "type":       "BUY_STOP",
-            "entry":      ea,
-            "sl":         sl_buy,
-            "tp":         tp_buy,
-            "sl_pips":    round(dist_b / pip_size, 1),
+            "level": lvl, "generation": generation, "source": source_price,
+            "type": "BUY_STOP", "entry": ea, "sl": sl_buy, "tp": tp_buy,
+            "sl_pips": round(dist_b / pip_size, 1),
         })
         orders.append({
-            "level":      lvl,
-            "generation": generation,
-            "source":     source_price,
-            "type":       "SELL_STOP",
-            "entry":      es,
-            "sl":         sl_sell,
-            "tp":         tp_sell,
-            "sl_pips":    round(dist_s / pip_size, 1),
+            "level": lvl, "generation": generation, "source": source_price,
+            "type": "SELL_STOP", "entry": es, "sl": sl_sell, "tp": tp_sell,
+            "sl_pips": round(dist_s / pip_size, 1),
         })
     return orders
 
@@ -165,11 +156,43 @@ def send_orders(orders: list, symbol: str, lot_size: float = None) -> list:
     results = []
     vol = lot_size if lot_size and lot_size > 0 else LOT_SIZE
 
+    # Get current price once for all orders in this batch
+    tick = mt5.symbol_info_tick(symbol)
+    current_price = (tick.bid + tick.ask) / 2 if tick else 0.0
+
     for o in orders:
         is_buy = o["type"] == "BUY_STOP"
         order_type = mt5.ORDER_TYPE_BUY_STOP if is_buy else mt5.ORDER_TYPE_SELL_STOP
         gen = o.get("generation", 0)
         lvl = o["level"]
+
+        # Safety checks before placing pending order:
+        if current_price > 0:
+            min_dist = _min_stop_distance(symbol)
+            entry    = o["entry"]
+
+            # 1. Entry must be on correct side of current price
+            if is_buy and current_price >= entry:
+                log.warning("⏭  %s G%d-L%d SKIPPED — price %.5f already above entry %.5f",
+                            o["type"], gen, lvl, current_price, entry)
+                results.append({"order": o, "ticket": None, "ok": False,
+                                "retcode": 0, "reason": "Price already past entry"})
+                continue
+            if not is_buy and current_price <= entry:
+                log.warning("⏭  %s G%d-L%d SKIPPED — price %.5f already below entry %.5f",
+                            o["type"], gen, lvl, current_price, entry)
+                results.append({"order": o, "ticket": None, "ok": False,
+                                "retcode": 0, "reason": "Price already past entry"})
+                continue
+
+            # 2. Entry must be far enough from current price (min stop distance)
+            dist_to_current = abs(entry - current_price)
+            if min_dist > 0 and dist_to_current < min_dist:
+                log.warning("⏭  %s G%d-L%d SKIPPED — entry %.5f too close to price %.5f (min=%.5f)",
+                            o["type"], gen, lvl, entry, current_price, min_dist)
+                results.append({"order": o, "ticket": None, "ok": False,
+                                "retcode": 0, "reason": f"Entry too close to price (min {min_dist:.5f})"})
+                continue
 
         request = {
             "action":       mt5.TRADE_ACTION_PENDING,
