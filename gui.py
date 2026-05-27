@@ -28,6 +28,7 @@ from PyQt5.QtWidgets import (
     QTabWidget, QTableWidget, QTableWidgetItem, QHeaderView,
     QDoubleSpinBox, QSpinBox, QComboBox, QSplitter, QSizePolicy,
     QProgressBar, QCheckBox, QSlider, QScrollArea, QFormLayout, QGridLayout,
+    QLineEdit,
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject
 from PyQt5.QtGui import QColor, QTextCursor, QFont
@@ -954,16 +955,36 @@ class GUI(QMainWindow):
         rf_layout = QVBoxLayout(grp_rf)
         rf_layout.setSpacing(6)
 
+        # Row 1: side selector
         rf_row1 = QHBoxLayout()
-        rf_row1.addWidget(QLabel("Side to protect:"))
+        rf_row1.addWidget(QLabel("Keep side:"))
         self.combo_rf_side = QComboBox()
         self.combo_rf_side.addItems(["BUY (keep buys)", "SELL (keep sells)"])
-        self.combo_rf_side.setToolTip(
-            "BUY: close all sells + pending, set SL line on buy positions\n"
-            "SELL: close all buys + pending, set SL line on sell positions")
         rf_row1.addWidget(self.combo_rf_side)
         rf_layout.addLayout(rf_row1)
 
+        # Row 2: SL price input + update button
+        rf_row2 = QHBoxLayout()
+        rf_row2.addWidget(QLabel("Exit price:"))
+        self.edit_rf_price = QLineEdit()
+        self.edit_rf_price.setPlaceholderText("e.g. 1.16420")
+        self.edit_rf_price.setToolTip(
+            "Price at which all kept positions close.\n"
+            "Leave blank to use average entry of kept positions.\n"
+            "Can be changed while RF is active using Update SL.")
+        self.edit_rf_price.setFixedWidth(95)
+        rf_row2.addWidget(self.edit_rf_price)
+        self.btn_rf_update = QPushButton("📍 Update SL")
+        self.btn_rf_update.setMinimumHeight(24)
+        self.btn_rf_update.setEnabled(False)
+        self.btn_rf_update.setToolTip(
+            "Move the SL exit price while RF is active")
+        self.btn_rf_update.clicked.connect(self._update_rf_sl)
+        rf_row2.addWidget(self.btn_rf_update)
+        rf_row2.addStretch()
+        rf_layout.addLayout(rf_row2)
+
+        # Row 3: Activate button
         self.btn_rf = QPushButton("🛡️  Activate Risk-Free")
         self.btn_rf.setObjectName("btn_start")
         self.btn_rf.setMinimumHeight(32)
@@ -1744,10 +1765,19 @@ class GUI(QMainWindow):
                 if res and res.retcode == _mt5.TRADE_RETCODE_DONE:
                     cancelled += 1
 
-        # Draw RF SL line at average entry of kept positions
-        avg_entry = sum(p.price_open for p in keep_pos) / len(keep_pos)
+        # Use user-specified exit price or fall back to average entry
+        try:
+            rf_price_text = self.edit_rf_price.text().strip()
+            sl_price = float(rf_price_text) if rf_price_text else 0.0
+        except ValueError:
+            sl_price = 0.0
+        if sl_price <= 0:
+            sl_price = round(
+                sum(p.price_open for p in keep_pos) / len(keep_pos), 5)
+            self.edit_rf_price.setText(f"{sl_price:.5f}")
         write_commands(
-            [f"DRAW_HLINE|TB_RF_SL|{avg_entry:.5f}|{0xFFD700}|2|0"], symbol=sym)
+            [f"DRAW_HLINE|TB_RF_SL|{sl_price:.5f}|{0xFFD700}|2|0"], symbol=sym)
+        avg_entry = sl_price
 
         # Store RF state for watcher to monitor
         self._rf_active = True
@@ -1762,9 +1792,30 @@ class GUI(QMainWindow):
             f"closed {closed} {close_side} | cancelled {cancelled} pending | "
             f"Gold SL line drawn @ {avg_entry:.5f} — DRAG IT in MT5 to set exit price", "NEW")
         self.lbl_rf_status.setText(
-            f"🛡️ Active: {n_keep} {keep_side} | SL @ {avg_entry:.5f} (drag in MT5)")
+            f"🛡️ Active: {n_keep} {keep_side} | exit @ {avg_entry:.5f}")
         self.lbl_rf_status.setStyleSheet(
             f"color:{C['gold']};font-size:10px;font-weight:bold;")
+        self.btn_rf_update.setEnabled(True)
+        self.btn_rf.setText("🛡️ RF Active")
+        self.btn_rf.setEnabled(False)
+
+    def _update_rf_sl(self):
+        """Update the RF SL exit price from the input field."""
+        if not getattr(self, "_rf_active", False):
+            return
+        try:
+            new_price = float(self.edit_rf_price.text().strip())
+        except ValueError:
+            self._on_log(
+                f"{datetime.now().strftime('%H:%M:%S')}  ⚠️  Invalid price — enter a number like 1.16420", "WARN")
+            return
+        sym = self._rf_sym
+        write_commands(
+            [f"DRAW_HLINE|TB_RF_SL|{new_price:.5f}|{0xFFD700}|2|0"], symbol=sym)
+        self._on_log(
+            f"{datetime.now().strftime('%H:%M:%S')}  📍  RF exit price updated → {new_price:.5f}", "NEW")
+        self.lbl_rf_status.setText(
+            f"🛡️ Active: {self._rf_keep_side} | exit @ {new_price:.5f}")
 
     def _check_rf_sl(self, candle: dict):
         """Called each scan cycle when RF mode is active. Closes all kept positions if SL line is touched."""
@@ -1827,9 +1878,12 @@ class GUI(QMainWindow):
                 f"{ts}  🛡️  Risk-Free SL hit @ {rf_price:.5f} | "
                 f"closed {closed} {self._rf_keep_side} positions with profit", "NEW")
             self._rf_active = False
-            self.lbl_rf_status.setText("Triggered — all positions closed")
+            self.lbl_rf_status.setText("✅ Triggered — all positions closed")
             self.lbl_rf_status.setStyleSheet(
                 f"color:{C['cyan']};font-size:10px;")
+            self.btn_rf_update.setEnabled(False)
+            self.btn_rf.setText("🛡️  Activate Risk-Free")
+            self.btn_rf.setEnabled(True)
             write_commands(["DELETE|TB_RF_SL"], symbol=sym)
 
     def _cancel_orders(self):
