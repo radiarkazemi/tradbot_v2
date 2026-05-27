@@ -7,26 +7,28 @@
 ║           and 3 below it, each 1.5 pips apart, diff colors      ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
-import sys, os as _os
-sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
-
-import os
-import time
-import logging
-from datetime import datetime
-from dataclasses import dataclass
-from typing import Optional
-import MetaTrader5 as mt5
-
-# Always create logs/ at project root, not cwd
-_ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
-os.makedirs(os.path.join(_ROOT, "logs"), exist_ok=True)
-
 from config import (
     MT5_LOGIN, MT5_PASSWORD, MT5_SERVER,
     WATCH_SYMBOL, SCAN_INTERVAL_SEC, LOG_LEVEL,
     AUTO_OBJECT_PREFIXES, PIP_STEP, BOT_LINE_PREFIX,
 )
+import MetaTrader5 as mt5
+from typing import Optional
+from dataclasses import dataclass
+from datetime import datetime
+import logging
+import time
+import os
+import sys
+import os as _os
+sys.path.insert(0, _os.path.dirname(
+    _os.path.dirname(_os.path.abspath(__file__))))
+
+
+# Always create logs/ at project root, not cwd
+_ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+os.makedirs(os.path.join(_ROOT, "logs"), exist_ok=True)
+
 try:
     from core.line_drawer import draw_level_lines, clear_level_lines, get_pip_size
 except ModuleNotFoundError:
@@ -38,7 +40,8 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler(os.path.join(_ROOT, "logs", "chart_watcher.log"), encoding="utf-8"),
+        logging.FileHandler(os.path.join(
+            _ROOT, "logs", "chart_watcher.log"), encoding="utf-8"),
     ],
 )
 log = logging.getLogger("chart_watcher")
@@ -56,23 +59,30 @@ class ChartObject:
     color:     int = 0
 
     @property
-    def is_hline(self):     return self.obj_type == "HLINE"
+    def is_hline(self): return self.obj_type == "HLINE"
+
     @property
-    def is_rectangle(self): return self.obj_type == "RECTANGLE" or self.type_id == 20
+    def is_rectangle(
+        self): return self.obj_type == "RECTANGLE" or self.type_id == 20
+
     @property
-    def is_trend(self):     return self.obj_type == "TREND"
+    def is_trend(self): return self.obj_type == "TREND"
+
     @property
     def rect_valid(self):
         # price2 must be non-zero and different from price1 to be a valid rectangle
         return (self.is_rectangle
                 and self.price2 != 0.0
                 and abs(self.price1 - self.price2) > 0.00001)
+
     @property
     def rect_top(self):
         return max(self.price1, self.price2) if self.rect_valid else None
+
     @property
     def rect_bottom(self):
         return min(self.price1, self.price2) if self.rect_valid else None
+
     @property
     def rect_height(self):
         return round(self.rect_top - self.rect_bottom, 5) if self.rect_valid else None
@@ -91,35 +101,94 @@ def is_auto_object(name: str) -> bool:
 
 
 def get_file_paths(symbol: str = None) -> list:
-    """Return candidate paths for the symbol-specific objects file."""
+    """Search ALL possible MT5 data paths — works across different computers."""
     paths = []
+    fname_sym = f"trader_objects_{symbol}.txt" if symbol else None
+    fname_gen = "trader_objects.txt"
+
+    # 1. Common folder via APPDATA
     appdata = os.environ.get("APPDATA", "")
-    common = os.path.join(appdata, "MetaQuotes", "Terminal", "Common", "Files")
+    if appdata:
+        common = os.path.join(appdata, "MetaQuotes",
+                              "Terminal", "Common", "Files")
+        if fname_sym:
+            paths.append(os.path.join(common, fname_sym))
+        paths.append(os.path.join(common, fname_gen))
 
-    if symbol:
-        # Symbol-specific file (new EA version)
-        paths.append(os.path.join(common, f"trader_objects_{symbol}.txt"))
-
-    # Legacy fallback — old EA uses generic name
-    paths.append(os.path.join(common, "trader_objects.txt"))
-
+    # 2. MT5 terminal data path (from running instance)
     try:
         info = mt5.terminal_info()
         if info and hasattr(info, "data_path") and info.data_path:
             local = os.path.join(info.data_path, "MQL5", "Files")
-            if symbol:
-                paths.append(os.path.join(local, f"trader_objects_{symbol}.txt"))
-            paths.append(os.path.join(local, "trader_objects.txt"))
+            if fname_sym:
+                paths.append(os.path.join(local, fname_sym))
+            paths.append(os.path.join(local, fname_gen))
     except Exception:
         pass
+
+    # 3. Scan ALL MetaQuotes terminal folders (handles multiple MT5 installations)
+    try:
+        mq_root = os.path.join(appdata, "MetaQuotes", "Terminal")
+        if os.path.isdir(mq_root):
+            for terminal_id in os.listdir(mq_root):
+                t_path = os.path.join(mq_root, terminal_id)
+                if os.path.isdir(t_path):
+                    local = os.path.join(t_path, "MQL5", "Files")
+                    if fname_sym:
+                        paths.append(os.path.join(local, fname_sym))
+                    paths.append(os.path.join(local, fname_gen))
+    except Exception:
+        pass
+
+    # 4. Also check roaming MetaQuotes path (some MT5 versions use different structure)
+    try:
+        roaming = os.path.join(os.environ.get("USERPROFILE", ""), "AppData",
+                               "Roaming", "MetaQuotes", "Terminal")
+        if os.path.isdir(roaming):
+            for terminal_id in os.listdir(roaming):
+                t_path = os.path.join(roaming, terminal_id)
+                if os.path.isdir(t_path):
+                    local = os.path.join(t_path, "MQL5", "Files")
+                    if fname_sym:
+                        paths.append(os.path.join(local, fname_sym))
+                    paths.append(os.path.join(local, fname_gen))
+    except Exception:
+        pass
+
     return paths
 
 
 def find_objects_file(symbol: str = None) -> Optional[str]:
-    for p in get_file_paths(symbol):
-        if os.path.exists(p):
-            return p
-    return None
+    """Return the most recently written matching file across all MT5 paths.
+    Also searches for files without _i suffix as fallback (broker symbol variants).
+    """
+    import time as _t
+
+    # Build search list: try exact symbol AND without _i suffix AND with _i suffix
+    symbols_to_try = [symbol]
+    if symbol:
+        if symbol.endswith("_i"):
+            symbols_to_try.append(symbol[:-2])  # XAUUSD_i → XAUUSD
+        else:
+            symbols_to_try.append(symbol + "_i")  # XAUUSD → XAUUSD_i
+        symbols_to_try.append(None)  # generic trader_objects.txt
+
+    best_path = None
+    best_age = float("inf")
+
+    for sym in symbols_to_try:
+        for p in get_file_paths(sym):
+            if os.path.exists(p):
+                try:
+                    age = _t.time() - os.path.getmtime(p)
+                    if age < best_age:
+                        best_age = age
+                        best_path = p
+                except Exception:
+                    if best_path is None:
+                        best_path = p
+
+    return best_path
 
 
 def parse_objects_file(path: str, filter_symbol: str = None) -> tuple:
@@ -158,14 +227,14 @@ def parse_objects_file(path: str, filter_symbol: str = None) -> tuple:
                 data[k] = v
         try:
             co = ChartObject(
-                name     = data.get("NAME", "?"),
-                obj_type = data.get("TYPE", "OTHER"),
-                type_id  = int(data.get("TYPEID", 0)),
-                price1   = float(data.get("PRICE1", 0)),
-                price2   = float(data.get("PRICE2", 0)),
-                time1    = _to_dt(data.get("TIME1", "0")),
-                time2    = _to_dt(data.get("TIME2", "0")),
-                color    = int(data.get("COLOR", 0)),
+                name=data.get("NAME", "?"),
+                obj_type=data.get("TYPE", "OTHER"),
+                type_id=int(data.get("TYPEID", 0)),
+                price1=float(data.get("PRICE1", 0)),
+                price2=float(data.get("PRICE2", 0)),
+                time1=_to_dt(data.get("TIME1", "0")),
+                time2=_to_dt(data.get("TIME2", "0")),
+                color=int(data.get("COLOR", 0)),
             )
             # Also skip VLINEs (type_id=0) — these are MT5 internal date markers
             if is_auto_object(co.name) or co.type_id == 0:
@@ -178,13 +247,15 @@ def parse_objects_file(path: str, filter_symbol: str = None) -> tuple:
     # Parse candle data from header
     candle = {}
     for line in lines:
-        for key in ("CANDLE_O","CANDLE_H","CANDLE_L","CANDLE_C","BID","CANDLE_T",
-                        "PREV_H","PREV_L","PREV_C","PREV_O","PREV_T"):
+        for key in ("CANDLE_O", "CANDLE_H", "CANDLE_L", "CANDLE_C", "BID", "CANDLE_T",
+                    "PREV_H", "PREV_L", "PREV_C", "PREV_O", "PREV_T"):
             if line.startswith(key + ":"):
                 try:
-                        val = line.strip().split(":",1)[1]
-                        candle[key] = int(val) if key in ("CANDLE_T","PREV_T") else float(val)
-                except: pass
+                    val = line.strip().split(":", 1)[1]
+                    candle[key] = int(val) if key in (
+                        "CANDLE_T", "PREV_T") else float(val)
+                except:
+                    pass
 
     log.debug("Parsed: %d trader objects, %d auto | EA=%s | H=%.5f L=%.5f",
               len(trader_objects), len(auto_objects), file_symbol,
@@ -218,7 +289,8 @@ def print_objects(trader_objects: list, auto_count: int,
     print(f"\n{sep}")
     print(f"  🕐  {datetime.now().strftime('%H:%M:%S')}   |   {WATCH_SYMBOL}   |   file: {file_age:.0f}s ago")
     if current_price:
-        print(f"  📊  Current price: {current_price:.5f}   |   auto-objects hidden: {auto_count}")
+        print(
+            f"  📊  Current price: {current_price:.5f}   |   auto-objects hidden: {auto_count}")
     print(sep)
 
     if not trader_objects:
@@ -228,7 +300,7 @@ def print_objects(trader_objects: list, auto_count: int,
         return
 
     hlines = [o for o in trader_objects if o.is_hline]
-    rects  = [o for o in trader_objects if o.is_rectangle]
+    rects = [o for o in trader_objects if o.is_rectangle]
     trends = [o for o in trader_objects if o.is_trend]
     others = [o for o in trader_objects
               if not o.is_hline and not o.is_rectangle and not o.is_trend]
@@ -236,7 +308,8 @@ def print_objects(trader_objects: list, auto_count: int,
     if hlines:
         pip = get_pip_size(WATCH_SYMBOL)
         step_price = PIP_STEP * pip
-        print(f"  📏  HORIZONTAL LINES ({len(hlines)})   [level spacing: {PIP_STEP} pips = {step_price:.5f}]")
+        print(
+            f"  📏  HORIZONTAL LINES ({len(hlines)})   [level spacing: {PIP_STEP} pips = {step_price:.5f}]")
         for o in hlines:
             dist = ""
             if current_price:
@@ -254,7 +327,8 @@ def print_objects(trader_objects: list, auto_count: int,
     if rects:
         print(f"  🟦  RECTANGLES ({len(rects)})")
         for o in rects:
-            print(f"      • [{o.name}]  top: {o.rect_top:.5f}  bottom: {o.rect_bottom:.5f}  height: {o.rect_height:.5f}")
+            print(
+                f"      • [{o.name}]  top: {o.rect_top:.5f}  bottom: {o.rect_bottom:.5f}  height: {o.rect_height:.5f}")
 
     if trends:
         print(f"  📉  TREND LINES ({len(trends)})")
@@ -264,7 +338,8 @@ def print_objects(trader_objects: list, auto_count: int,
     if others:
         print(f"  📌  OTHER ({len(others)})")
         for o in others:
-            print(f"      • [{o.name}]  type: {o.obj_type}  price: {o.price1:.5f}")
+            print(
+                f"      • [{o.name}]  type: {o.obj_type}  price: {o.price1:.5f}")
 
     print(sep)
 
@@ -280,7 +355,8 @@ def main():
     pip = get_pip_size(WATCH_SYMBOL)
     log.info("Symbol: %s  |  pip size: %.5f  |  step: %.1f pips = %.5f",
              WATCH_SYMBOL, pip, PIP_STEP, PIP_STEP * pip)
-    log.info("Draw a horizontal line on your chart — bot will add 3+3 levels around it.")
+    log.info(
+        "Draw a horizontal line on your chart — bot will add 3+3 levels around it.")
     log.info("Press Ctrl+C to stop.")
 
     prev_trader_names: set = set()
@@ -294,9 +370,11 @@ def main():
 
             if path is None:
                 if not warned_missing:
-                    log.warning("⚠️  trader_objects.txt not found — is ObjectExporter EA on the chart?")
+                    log.warning(
+                        "⚠️  trader_objects.txt not found — is ObjectExporter EA on the chart?")
                     warned_missing = True
-                print(f"\n  ⏳  {datetime.now().strftime('%H:%M:%S')}  Waiting for ObjectExporter EA…")
+                print(
+                    f"\n  ⏳  {datetime.now().strftime('%H:%M:%S')}  Waiting for ObjectExporter EA…")
                 time.sleep(SCAN_INTERVAL_SEC)
                 continue
 
@@ -306,33 +384,36 @@ def main():
             current_price = get_current_price()
 
             current_names = {o.name for o in trader_objects}
-            added   = current_names - prev_trader_names
+            added = current_names - prev_trader_names
             removed = prev_trader_names - current_names
 
             # ── Handle NEW objects ────────────────────────────
             for name in added:
                 obj = next(o for o in trader_objects if o.name == name)
-                log.info("🆕  TRADER drew: [%s]  %s  @ %.5f", name, obj.obj_type, obj.price1)
+                log.info("🆕  TRADER drew: [%s]  %s  @ %.5f",
+                         name, obj.obj_type, obj.price1)
 
                 if obj.is_hline:
                     step, cmds = draw_level_lines(
-                        symbol       = WATCH_SYMBOL,
-                        source_name  = name,
-                        source_price = obj.price1,
-                        pip_step     = PIP_STEP,
-                        prefix       = BOT_LINE_PREFIX,
+                        symbol=WATCH_SYMBOL,
+                        source_name=name,
+                        source_price=obj.price1,
+                        pip_step=PIP_STEP,
+                        prefix=BOT_LINE_PREFIX,
                     )
                     drawn_levels[name] = obj.price1
-                    log.info("🎯  Drew 3 levels above + 3 below  [step=%.5f]", step)
+                    log.info(
+                        "🎯  Drew 3 levels above + 3 below  [step=%.5f]", step)
 
                 elif obj.is_rectangle:
                     if not obj.rect_valid:
-                        log.debug("Rectangle [%s] not yet fully drawn — skipping", name)
+                        log.debug(
+                            "Rectangle [%s] not yet fully drawn — skipping", name)
                         continue
-                    top    = obj.rect_top
+                    top = obj.rect_top
                     bottom = obj.rect_bottom
-                    pip    = get_pip_size(WATCH_SYMBOL)
-                    step   = PIP_STEP * pip
+                    pip = get_pip_size(WATCH_SYMBOL)
+                    step = PIP_STEP * pip
                     log.info("🟦  Rectangle — top: %.5f  bottom: %.5f  height: %.5f",
                              top, bottom, obj.rect_height)
                     # 3 lines ABOVE the top edge only
@@ -341,11 +422,13 @@ def main():
                     colors_below = [0x80FF00, 0x50CC00, 0x309900]
                     for i, clr in enumerate(colors_above, 1):
                         nm = f"{BOT_LINE_PREFIX}ABOVE_{i}_{name[:20]}"
-                        cmds.append(f"DRAW_HLINE|{nm}|{top + step*i:.5f}|{clr}|1|1")
+                        cmds.append(
+                            f"DRAW_HLINE|{nm}|{top + step*i:.5f}|{clr}|1|1")
                     # 3 lines BELOW the bottom edge only
                     for i, clr in enumerate(colors_below, 1):
                         nm = f"{BOT_LINE_PREFIX}BELOW_{i}_{name[:20]}"
-                        cmds.append(f"DRAW_HLINE|{nm}|{bottom - step*i:.5f}|{clr}|1|1")
+                        cmds.append(
+                            f"DRAW_HLINE|{nm}|{bottom - step*i:.5f}|{clr}|1|1")
                     from line_drawer import write_commands
                     write_commands(cmds)
                     drawn_levels[name] = ("RECT", top, bottom)
@@ -367,16 +450,17 @@ def main():
                         log.info("↕️   LINE MOVED: [%s]  %.5f → %.5f — redrawing levels",
                                  obj.name, drawn_levels[obj.name], obj.price1)
                         step, _ = draw_level_lines(
-                            symbol       = WATCH_SYMBOL,
-                            source_name  = obj.name,
-                            source_price = obj.price1,
-                            pip_step     = PIP_STEP,
-                            prefix       = BOT_LINE_PREFIX,
+                            symbol=WATCH_SYMBOL,
+                            source_name=obj.name,
+                            source_price=obj.price1,
+                            pip_step=PIP_STEP,
+                            prefix=BOT_LINE_PREFIX,
                         )
                         drawn_levels[obj.name] = obj.price1
 
             prev_trader_names = current_names
-            print_objects(trader_objects, len(auto_objects), current_price, file_age)
+            print_objects(trader_objects, len(
+                auto_objects), current_price, file_age)
             time.sleep(SCAN_INTERVAL_SEC)
 
     except KeyboardInterrupt:
