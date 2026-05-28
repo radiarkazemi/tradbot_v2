@@ -118,13 +118,19 @@ void ExportObjects()
       lines += row + "\n";
      }
 
-   int flags = FILE_WRITE | FILE_TXT | FILE_ANSI;
-   if(UseCommonFolder) flags |= FILE_COMMON;
+   int flags = FILE_WRITE | FILE_TXT | FILE_ANSI | FILE_COMMON;
    int fh = FileOpen(ObjFile(), flags);
    if(fh != INVALID_HANDLE)
      {
       FileWriteString(fh, lines);
       FileClose(fh);
+      static int writeCount = 0;
+      if(writeCount++ % 30 == 0)  // log every 30 writes (~60s)
+         Print("ObjectExporter: wrote ", ObjFile(), " (", total, " objects)");
+     }
+   else
+     {
+      Print("ObjectExporter: FAILED to write ", ObjFile(), " error=", GetLastError());
      }
   }
 
