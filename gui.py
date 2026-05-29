@@ -4,7 +4,22 @@
 ║  pip install PyQt5   →   python gui.py                          ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
-import sys, os, threading
+import session_report as sr
+from watcher import WatcherWorker
+from chart_widget import CandleChartWidget
+from core import chart_watcher as cw
+from core.backtest_engine import run_backtest
+from core.order_manager import place_level_orders, send_orders, cancel_all_tb_orders
+from core.line_drawer import draw_level_lines, clear_level_lines, get_pip_size, write_commands, STYLE_DASH, CLR_ABOVE_1, CLR_ABOVE_2, CLR_ABOVE_3, CLR_BELOW_1, CLR_BELOW_2, CLR_BELOW_3
+from config import (
+    MT5_LOGIN, MT5_PASSWORD, MT5_SERVER,
+    WATCH_SYMBOL, SCAN_INTERVAL_SEC,
+    AUTO_OBJECT_PREFIXES, PIP_STEP, BOT_LINE_PREFIX,
+    LOT_SIZE, TP_RR_RATIO, MAGIC_NUMBER,
+)
+import sys
+import os
+import threading
 from datetime import datetime
 from typing import Optional
 
@@ -21,26 +36,15 @@ from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject
 from PyQt5.QtGui import QColor, QTextCursor, QFont
 
 os.makedirs("logs", exist_ok=True)
-from config import (
-    MT5_LOGIN, MT5_PASSWORD, MT5_SERVER,
-    WATCH_SYMBOL, SCAN_INTERVAL_SEC,
-    AUTO_OBJECT_PREFIXES, PIP_STEP, BOT_LINE_PREFIX,
-    LOT_SIZE, TP_RR_RATIO, MAGIC_NUMBER,
-)
-from core.line_drawer  import draw_level_lines, clear_level_lines, get_pip_size, write_commands, STYLE_DASH, CLR_ABOVE_1, CLR_ABOVE_2, CLR_ABOVE_3, CLR_BELOW_1, CLR_BELOW_2, CLR_BELOW_3
-from core.order_manager import place_level_orders, send_orders, cancel_all_tb_orders
-from core.backtest_engine import run_backtest
-from core import chart_watcher as cw
-from chart_widget import CandleChartWidget
 
 # ── Palette ──────────────────────────────────────────────────────
 C = {
-    "bg":"#0D1117","panel":"#161B22","card":"#1C2333","input":"#141D2E",
-    "border":"#2A3550","border_hi":"#4A6090",
-    "txt":"#E8EDF5","txt2":"#8B9BB4","txt3":"#4A5568",
-    "gold":"#F5A623","green":"#00D97E","green_dk":"#003D22",
-    "red":"#FF4560","red_dk":"#3D0015","orange":"#FF8C00",
-    "cyan":"#00BCD4","blue":"#2979FF","purple":"#B388FF",
+    "bg": "#0D1117", "panel": "#161B22", "card": "#1C2333", "input": "#141D2E",
+    "border": "#2A3550", "border_hi": "#4A6090",
+    "txt": "#E8EDF5", "txt2": "#8B9BB4", "txt3": "#4A5568",
+    "gold": "#F5A623", "green": "#00D97E", "green_dk": "#003D22",
+    "red": "#FF4560", "red_dk": "#3D0015", "orange": "#FF8C00",
+    "cyan": "#00BCD4", "blue": "#2979FF", "purple": "#B388FF",
 }
 
 SS = f"""
@@ -104,22 +108,21 @@ QSplitter::handle {{ background:{C['border']}; }}
 # ── Watcher signals & worker ──────────────────────────────────────
 class Sig(QObject):
     new_objects = pyqtSignal(list, list)
-    status      = pyqtSignal(str)
-    log_line    = pyqtSignal(str, str)
-    bt_done     = pyqtSignal()
+    status = pyqtSignal(str)
+    log_line = pyqtSignal(str, str)
+    bt_done = pyqtSignal()
 
-
-from watcher import WatcherWorker
 
 # ── Main Window ──────────────────────────────────────────────────
+
 class GUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("TraderBot v1")
-        self.setMinimumSize(1100, 720)
+        self.setMinimumSize(820, 600)
         self.setStyleSheet(SS)
         self._worker: Optional[WatcherWorker] = None
-        self._sig    = Sig()
+        self._sig = Sig()
         self._sig.new_objects.connect(self._on_objects)
         self._sig.status.connect(self._on_status)
         self._sig.log_line.connect(self._on_log)
@@ -131,30 +134,44 @@ class GUI(QMainWindow):
         self._session_start = datetime.now()
         self._build_ui()
         QTimer.singleShot(100, self._init_mt5_price)
-        self._pt = QTimer(); self._pt.timeout.connect(self._refresh_price); self._pt.start(1000)
+        self._pt = QTimer()
+        self._pt.timeout.connect(self._refresh_price)
+        self._pt.start(1000)
 
     # ─────────────────────────────── UI BUILD ────────────────────
 
     def _build_ui(self):
-        root = QWidget(); self.setCentralWidget(root)
-        vl = QVBoxLayout(root); vl.setSpacing(6); vl.setContentsMargins(10,10,10,10)
+        root = QWidget()
+        self.setCentralWidget(root)
+        vl = QVBoxLayout(root)
+        vl.setSpacing(6)
+        vl.setContentsMargins(10, 10, 10, 10)
         vl.addWidget(self._header())
         spl = QSplitter(Qt.Horizontal)
         spl.addWidget(self._left_panel())
         spl.addWidget(self._right_panel())
-        spl.setSizes([370, 730])
+        spl.setSizes([360, 740])
+        spl.setCollapsible(0, False)
+        spl.setCollapsible(1, False)
+        # Left panel: minimum 280px, can grow
+        spl.widget(0).setMinimumWidth(280)
         vl.addWidget(spl, 1)
         vl.addWidget(self._status_bar())
 
     def _header(self):
         w = QFrame()
-        w.setStyleSheet(f"background:{C['panel']};border:1px solid {C['border']};border-radius:6px;")
-        hl = QHBoxLayout(w); hl.setContentsMargins(14,8,14,8)
-        t = QLabel("📈  TraderBot  <span style='color:#4A5568;font-size:10px;'>v1.0</span>")
+        w.setStyleSheet(
+            f"background:{C['panel']};border:1px solid {C['border']};border-radius:6px;")
+        hl = QHBoxLayout(w)
+        hl.setContentsMargins(14, 8, 14, 8)
+        t = QLabel(
+            "📈  TraderBot  <span style='color:#4A5568;font-size:10px;'>v1.0</span>")
         t.setStyleSheet(f"color:{C['gold']};font-size:16px;font-weight:bold;")
-        hl.addWidget(t); hl.addStretch()
+        hl.addWidget(t)
+        hl.addStretch()
         self.lbl_price = QLabel("Price: —")
-        self.lbl_price.setStyleSheet(f"color:{C['cyan']};font-family:Consolas;font-size:14px;font-weight:bold;")
+        self.lbl_price.setStyleSheet(
+            f"color:{C['cyan']};font-family:Consolas;font-size:14px;font-weight:bold;")
         hl.addWidget(self.lbl_price)
         hl.addWidget(self._vline())
         self.lbl_sym = QLabel(WATCH_SYMBOL)
@@ -163,7 +180,8 @@ class GUI(QMainWindow):
         hl.addWidget(self._vline())
         self.lbl_ea_chart = QLabel("EA: —")
         self.lbl_ea_chart.setStyleSheet(f"color:{C['txt3']};font-size:10px;")
-        self.lbl_ea_chart.setToolTip("Which chart the ObjectExporter EA is currently on")
+        self.lbl_ea_chart.setToolTip(
+            "Which chart the ObjectExporter EA is currently on")
         hl.addWidget(self.lbl_ea_chart)
         hl.addWidget(self._vline())
         self.lbl_status = QLabel("⚫  Stopped")
@@ -172,64 +190,98 @@ class GUI(QMainWindow):
         hl.addWidget(self._vline())
         # Strategy phase indicator
         self.lbl_phase = QLabel("Phase: —")
-        self.lbl_phase.setStyleSheet(f"color:{C['txt3']};font-size:10px;font-family:Consolas;")
+        self.lbl_phase.setStyleSheet(
+            f"color:{C['txt3']};font-size:10px;font-family:Consolas;")
         hl.addWidget(self.lbl_phase)
         return w
 
     def _left_panel(self):
-        w = QWidget(); vl = QVBoxLayout(w); vl.setSpacing(8); vl.setContentsMargins(0,0,4,0)
+        # Wrap in scroll area so left panel works at any window height
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setStyleSheet(
+            "QScrollArea { border: none; background: transparent; }"
+            "QScrollBar:vertical { width: 6px; background: transparent; }"
+            "QScrollBar::handle:vertical { background: #2A3550; border-radius: 3px; }"
+            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }")
+        w = QWidget()
+        vl = QVBoxLayout(w)
+        vl.setSpacing(8)
+        vl.setContentsMargins(0, 0, 4, 0)
 
         # ── Controls ─────────────────────────────────────────────
-        grp = QGroupBox("⚙️  Bot Control"); cl = QVBoxLayout(grp); cl.setSpacing(4)
+        grp = QGroupBox("⚙️  Bot Control")
+        cl = QVBoxLayout(grp)
+        cl.setSpacing(4)
 
         def _lbl(text, tooltip=""):
             l = QLabel(text)
-            l.setStyleSheet(f"color:{C['txt2']};font-size:11px;min-width:90px;")
-            if tooltip: l.setToolTip(tooltip)
+            l.setStyleSheet(f"color:{C['txt2']};font-size:11px;")
+            l.setWordWrap(False)
+            if tooltip:
+                l.setToolTip(tooltip)
             return l
 
         def _row(label, widget, tooltip=""):
-            hl = QHBoxLayout(); hl.setSpacing(8)
-            hl.addWidget(_lbl(label, tooltip))
-            widget.setFixedWidth(160)
+            hl = QHBoxLayout()
+            hl.setSpacing(8)
+            lw = _lbl(label, tooltip)
+            lw.setFixedWidth(90)
+            hl.addWidget(lw)
+            widget.setMinimumWidth(100)
+            widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             hl.addWidget(widget)
-            hl.addStretch()
             cl.addLayout(hl)
 
         # Symbol
-        self.sym_combo = QComboBox(); self.sym_combo.setEditable(True)
-        self.sym_combo.addItems(["XAUUSD_i","EURUSD_i","GBPUSD_i",
-                                  "XAUUSD","EURUSD","GBPUSD","NAS100","US30","BTCUSD"])
+        self.sym_combo = QComboBox()
+        self.sym_combo.setEditable(True)
+        self.sym_combo.addItems(["XAUUSD_i", "EURUSD_i", "GBPUSD_i",
+                                 "XAUUSD", "EURUSD", "GBPUSD", "NAS100", "US30", "BTCUSD"])
         self.sym_combo.setCurrentText("EURUSD")
         self.sym_combo.currentTextChanged.connect(self._on_symbol_changed)
         _row("🎯 Symbol:", self.sym_combo, "The symbol to watch on MT5")
 
         # Pip step
         self.spin_pip = QDoubleSpinBox()
-        self.spin_pip.setRange(0.1, 500.0); self.spin_pip.setSingleStep(1.0)
-        self.spin_pip.setValue(PIP_STEP); self.spin_pip.setDecimals(1)
-        _row("📏 Pip step:", self.spin_pip, "Distance between each level (L1/L2/L3) in pips")
+        self.spin_pip.setRange(0.1, 500.0)
+        self.spin_pip.setSingleStep(1.0)
+        self.spin_pip.setValue(PIP_STEP)
+        self.spin_pip.setDecimals(1)
+        _row("📏 Pip step:", self.spin_pip,
+             "Distance between each level (L1/L2/L3) in pips")
 
         # TP pips with checkbox
-        tp_row = QHBoxLayout(); tp_row.setSpacing(8)
+        tp_row = QHBoxLayout()
+        tp_row.setSpacing(8)
+        lbl_tp = _lbl("🎯 TP pips:")
+        lbl_tp.setFixedWidth(90)
+        tp_row.addWidget(lbl_tp)
         self.chk_tp = QCheckBox()
         self.chk_tp.setChecked(False)
-        self.chk_tp.setToolTip("Enable fixed TP. Unchecked = no TP set (orders run until SL or manual close)")
+        self.chk_tp.setToolTip(
+            "Enable fixed TP. Unchecked = no TP set (orders run until SL or manual close)")
         self.chk_tp.setStyleSheet(f"color:{C['txt2']};")
-        tp_row.addWidget(_lbl("🎯 TP pips:"))
         tp_row.addWidget(self.chk_tp)
         self.spin_tp = QDoubleSpinBox()
-        self.spin_tp.setRange(1, 1000.0); self.spin_tp.setSingleStep(5.0)
-        self.spin_tp.setValue(50); self.spin_tp.setDecimals(1)
+        self.spin_tp.setRange(1, 1000.0)
+        self.spin_tp.setSingleStep(5.0)
+        self.spin_tp.setValue(50)
+        self.spin_tp.setDecimals(1)
         self.spin_tp.setEnabled(False)
+        self.spin_tp.setMinimumWidth(70)
+        self.spin_tp.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.chk_tp.toggled.connect(self.spin_tp.setEnabled)
-        tp_row.addWidget(self.spin_tp); tp_row.addStretch()
+        tp_row.addWidget(self.spin_tp)
         cl.addLayout(tp_row)
 
         # Lot size
         self.spin_lot = QDoubleSpinBox()
-        self.spin_lot.setRange(0.01, 100.0); self.spin_lot.setSingleStep(0.01)
-        self.spin_lot.setValue(LOT_SIZE); self.spin_lot.setDecimals(2)
+        self.spin_lot.setRange(0.01, 100.0)
+        self.spin_lot.setSingleStep(0.01)
+        self.spin_lot.setValue(LOT_SIZE)
+        self.spin_lot.setDecimals(2)
         _row("📦 Lot size:", self.spin_lot, "Lot size per order")
 
         # Spawn level
@@ -240,8 +292,10 @@ class GUI(QMainWindow):
              "Which activated level spawns a new cascading round")
 
         # Separator
-        sep = QFrame(); sep.setFrameShape(QFrame.HLine)
-        sep.setStyleSheet(f"color:{C['border']};"); cl.addWidget(sep)
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet(f"color:{C['border']};")
+        cl.addWidget(sep)
 
         # Start / Stop buttons
         self.btn_start = QPushButton("▶  Start Watcher")
@@ -259,18 +313,23 @@ class GUI(QMainWindow):
 
         self.chk_follow = QCheckBox("🔗  Follow object when moved")
         self.chk_follow.setChecked(True)
-        self.chk_follow.setStyleSheet(f"color:{C['txt2']};font-size:10px;padding:2px 0;")
-        self.chk_follow.setToolTip("Level lines redraw if you drag the drawn object")
+        self.chk_follow.setStyleSheet(
+            f"color:{C['txt2']};font-size:10px;padding:2px 0;")
+        self.chk_follow.setToolTip(
+            "Level lines redraw if you drag the drawn object")
         cl.addWidget(self.chk_follow)
         vl.addWidget(grp)
 
         # ── Strategy summary ─────────────────────────────────────
         grp_strat = QGroupBox("📊  Strategy State")
-        sv = QGridLayout(grp_strat); sv.setSpacing(4); sv.setContentsMargins(8,6,8,6)
+        sv = QGridLayout(grp_strat)
+        sv.setSpacing(4)
+        sv.setContentsMargins(8, 6, 8, 6)
 
         def _stat_label(text, color):
             l = QLabel(text)
-            l.setStyleSheet(f"color:{color};font-family:Consolas;font-size:11px;font-weight:bold;")
+            l.setStyleSheet(
+                f"color:{color};font-family:Consolas;font-size:11px;font-weight:bold;")
             return l
 
         def _stat_key(text):
@@ -279,9 +338,9 @@ class GUI(QMainWindow):
             return l
 
         self.lbl_source_price = _stat_label("—", C['gold'])
-        self.lbl_rounds_info  = _stat_label("0 / 9", C['cyan'])
-        self.lbl_waiting      = _stat_label("Draw a line on chart", C['txt3'])
-        self.lbl_direction    = _stat_label("—", C['txt2'])
+        self.lbl_rounds_info = _stat_label("0 / 9", C['cyan'])
+        self.lbl_waiting = _stat_label("Draw a line on chart", C['txt3'])
+        self.lbl_direction = _stat_label("—", C['txt2'])
 
         sv.addWidget(_stat_key("Source:"),    0, 0)
         sv.addWidget(self.lbl_source_price,   0, 1)
@@ -294,47 +353,224 @@ class GUI(QMainWindow):
         sv.setColumnStretch(1, 1)
         vl.addWidget(grp_strat)
 
+        # ── Peak P&L Dashboard ────────────────────────────────────
+        grp_peak = QGroupBox("📈  Peak P&L Tracker")
+        grp_peak.setStyleSheet(
+            f"QGroupBox {{ background:{C['card']};border:1px solid {C['border_hi']};"
+            f"border-radius:6px;margin-top:14px;padding:8px 6px 6px 6px;"
+            f"font-size:10px;font-weight:bold;color:{C['gold']}; }}"
+            f"QGroupBox::title {{ subcontrol-origin:margin;left:10px;padding:0 4px; }}")
+        pv = QVBoxLayout(grp_peak)
+        pv.setSpacing(4)
+        pv.setContentsMargins(8, 6, 8, 6)
+
+        # Big P&L numbers row
+        pnl_row = QHBoxLayout()
+        pnl_row.setSpacing(6)
+
+        def _big_card(key, label, color):
+            f = QFrame()
+            f.setStyleSheet(
+                f"background:{C['bg']};border:1px solid {C['border']};"
+                f"border-radius:5px;")
+            fv = QVBoxLayout(f)
+            fv.setContentsMargins(6, 4, 6, 4)
+            fv.setSpacing(1)
+            lt = QLabel(label)
+            lt.setStyleSheet(
+                f"color:{C['txt3']};font-size:8px;font-weight:bold;letter-spacing:1px;")
+            lt.setAlignment(Qt.AlignCenter)
+            lv = QLabel("—")
+            lv.setStyleSheet(
+                f"color:{color};font-size:17px;font-weight:bold;font-family:Consolas;")
+            lv.setAlignment(Qt.AlignCenter)
+            fv.addWidget(lt)
+            fv.addWidget(lv)
+            self._peak_cards[key] = lv
+            return f
+
+        self._peak_cards = {}
+        pnl_row.addWidget(_big_card("current",  "NOW",    C['cyan']))
+        pnl_row.addWidget(_big_card("peak",     "PEAK",   C['green']))
+        pnl_row.addWidget(_big_card("drawdown", "FROM PEAK", C['red']))
+        pv.addLayout(pnl_row)
+
+        # Alert threshold row
+        alert_row = QHBoxLayout()
+        alert_row.setSpacing(6)
+        lbl_al = QLabel("🔔 Alert at:")
+        lbl_al.setStyleSheet(f"color:{C['txt2']};font-size:11px;")
+        alert_row.addWidget(lbl_al)
+        self.spin_alert = QDoubleSpinBox()
+        self.spin_alert.setRange(1, 10000)
+        self.spin_alert.setValue(50)
+        self.spin_alert.setDecimals(1)
+        self.spin_alert.setSuffix(" $")
+        self.spin_alert.setMinimumWidth(80)
+        self.spin_alert.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.spin_alert.setToolTip(
+            "Flash and sound alert when total P&L crosses this value.\n"
+            "Does NOT auto-close — you decide when to exit.")
+        alert_row.addWidget(self.spin_alert)
+        self.chk_alert = QCheckBox("enabled")
+        self.chk_alert.setChecked(True)
+        self.chk_alert.setStyleSheet(f"color:{C['txt2']};font-size:10px;")
+        alert_row.addWidget(self.chk_alert)
+        alert_row.addStretch()
+        pv.addLayout(alert_row)
+
+        # Status line
+        self.lbl_peak_status = QLabel("Start watcher to begin tracking")
+        self.lbl_peak_status.setStyleSheet(
+            f"color:{C['txt3']};font-size:9px;font-family:Consolas;")
+        self.lbl_peak_status.setWordWrap(True)
+        pv.addWidget(self.lbl_peak_status)
+
+        # Close All & Reset button — big, prominent
+        self.btn_close_reset = QPushButton("🏁  Close All Positions & Reset")
+        self.btn_close_reset.setMinimumHeight(38)
+        self.btn_close_reset.setStyleSheet(
+            f"QPushButton {{ background:#1A0A2A;color:{C['purple']};"
+            f"border:2px solid {C['purple']};border-radius:5px;"
+            f"font-weight:bold;font-size:13px; }}"
+            f"QPushButton:hover {{ background:{C['purple']};color:#fff; }}"
+            f"QPushButton:pressed {{ background:#0A0015; }}")
+        self.btn_close_reset.setToolTip(
+            "Close ALL open positions + cancel ALL pending orders\n"
+            "then reset the bot state (rounds, source lines, peak tracker).\n"
+            "Use this when you see the peak and want a clean restart.")
+        self.btn_close_reset.clicked.connect(self._close_all_and_reset)
+        pv.addWidget(self.btn_close_reset)
+
+        vl.addWidget(grp_peak)
+
+        # Internal peak tracking state
+        self._session_peak_pnl = 0.0
+        self._session_peak_alerted = False
+        self._peak_timer = QTimer()
+        self._peak_timer.timeout.connect(self._refresh_peak_pnl)
+        self._peak_timer.start(1000)  # update every second
+
         # ── Orders ───────────────────────────────────────────────
-        grp2 = QGroupBox("Live Orders"); ol = QVBoxLayout(grp2)
+        grp2 = QGroupBox("Live Orders")
+        ol = QVBoxLayout(grp2)
         self.btn_place = QPushButton("🎯  Place Buy/Sell Stops")
-        self.btn_place.setObjectName("btn_orders"); self.btn_place.setMinimumHeight(34)
-        self.btn_place.setEnabled(False); self.btn_place.clicked.connect(self._place_orders)
+        self.btn_place.setObjectName("btn_orders")
+        self.btn_place.setMinimumHeight(34)
+        self.btn_place.setEnabled(False)
+        self.btn_place.clicked.connect(self._place_orders)
         ol.addWidget(self.btn_place)
         self.btn_cancel = QPushButton("🗑️  Cancel All Bot Orders")
-        self.btn_cancel.setObjectName("btn_cancel"); self.btn_cancel.clicked.connect(self._cancel_orders)
+        self.btn_cancel.setObjectName("btn_cancel")
+        self.btn_cancel.clicked.connect(self._cancel_orders)
         ol.addWidget(self.btn_cancel)
 
         # ── Risk-Free section ─────────────────────────────────────
         grp_rf = QGroupBox("🛡️  Risk-Free Mode")
-        rf_layout = QVBoxLayout(grp_rf); rf_layout.setSpacing(6)
+        rf_layout = QVBoxLayout(grp_rf)
+        rf_layout.setSpacing(6)
 
         # Row 1: side selector
         rf_row1 = QHBoxLayout()
-        rf_row1.addWidget(QLabel("Keep side:"))
+        rf_row1.setSpacing(6)
+        lbl_ks = QLabel("Keep side:")
+        lbl_ks.setStyleSheet(f"color:{C['txt2']};font-size:11px;")
+        rf_row1.addWidget(lbl_ks)
         self.combo_rf_side = QComboBox()
         self.combo_rf_side.addItems(["BUY (keep buys)", "SELL (keep sells)"])
+        self.combo_rf_side.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.combo_rf_side.currentTextChanged.connect(self._refresh_rf_advisor)
         rf_row1.addWidget(self.combo_rf_side)
         rf_layout.addLayout(rf_row1)
 
-        # Row 2: SL price input + update button
-        rf_row2 = QHBoxLayout()
-        rf_row2.addWidget(QLabel("Exit price:"))
+        # ── RF Advisor panel ──────────────────────────────────────
+        adv_frame = QFrame()
+        adv_frame.setStyleSheet(
+            f"background:{C['card']};border:1px solid {C['border']};border-radius:5px;")
+        adv_layout = QVBoxLayout(adv_frame)
+        adv_layout.setContentsMargins(8, 6, 8, 6)
+        adv_layout.setSpacing(4)
+
+        adv_title = QLabel("📊 Suggested SL levels:")
+        adv_title.setStyleSheet(
+            f"color:{C['txt3']};font-size:9px;font-weight:bold;")
+        adv_layout.addWidget(adv_title)
+
+        # Three suggestion rows: Conservative / Balanced / Aggressive
+        self._rf_suggestions = {}
+        for key, label, color, tip in [
+            ("safe",  "🟢 Conservative (all in profit):",    C["green"],
+             "SL just below the SMALLEST (most exposed) position\n"
+             "Every kept position is profitable at this SL price"),
+            ("mid",   "🟡 Balanced (avg entry):",            C["gold"],
+             "SL at average entry price of all kept positions\n"
+             "Half the positions in profit, half at break-even zone"),
+            ("bold",  "🔴 Aggressive (best pos safe only):", C["red"],
+             "SL just below the BEST (most profitable) position's entry\n"
+             "Only the most profitable position is guaranteed safe"),
+        ]:
+            row = QHBoxLayout()
+            row.setSpacing(6)
+            lbl_key = QLabel(label)
+            lbl_key.setStyleSheet(f"color:{C['txt3']};font-size:9px;")
+            lbl_key.setWordWrap(True)
+            lbl_key.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+            lbl_key.setToolTip(tip)
+            lbl_val = QLabel("—")
+            lbl_val.setStyleSheet(
+                f"color:{color};font-family:Consolas;font-size:11px;font-weight:bold;")
+            btn_use = QPushButton("Use")
+            btn_use.setFixedSize(36, 20)
+            btn_use.setStyleSheet(
+                f"background:{C['border']};color:{C['txt2']};font-size:9px;"
+                f"border:1px solid {C['border_hi']};border-radius:3px;padding:0;")
+            btn_use.clicked.connect(
+                lambda _, k=key: self._rf_use_suggestion(k))
+            row.addWidget(lbl_key)
+            row.addWidget(lbl_val)
+            row.addWidget(btn_use)
+            adv_layout.addLayout(row)
+            self._rf_suggestions[key] = {"label": lbl_val, "value": None}
+
+        # Positions summary line
+        self.lbl_rf_pos_summary = QLabel("Click 🔄 to load positions")
+        self.lbl_rf_pos_summary.setStyleSheet(
+            f"color:{C['txt3']};font-size:9px;")
+        self.lbl_rf_pos_summary.setWordWrap(True)
+        adv_layout.addWidget(self.lbl_rf_pos_summary)
+
+        btn_adv_refresh = QPushButton("🔄 Refresh")
+        btn_adv_refresh.setFixedHeight(22)
+        btn_adv_refresh.clicked.connect(self._refresh_rf_advisor)
+        adv_layout.addWidget(btn_adv_refresh)
+        rf_layout.addWidget(adv_frame)
+
+        # Row 2: exit price label + input
+        rf_row2a = QHBoxLayout()
+        rf_row2a.setSpacing(6)
+        lbl_ep = QLabel("Exit price:")
+        lbl_ep.setStyleSheet(f"color:{C['txt2']};font-size:11px;")
+        rf_row2a.addWidget(lbl_ep)
         self.edit_rf_price = QLineEdit()
         self.edit_rf_price.setPlaceholderText("e.g. 1.16420")
         self.edit_rf_price.setToolTip(
             "Price at which all kept positions close.\n"
             "Leave blank to use average entry of kept positions.\n"
             "Can be changed while RF is active using Update SL.")
-        self.edit_rf_price.setFixedWidth(95)
-        rf_row2.addWidget(self.edit_rf_price)
-        self.btn_rf_update = QPushButton("📍 Update SL")
-        self.btn_rf_update.setMinimumHeight(24)
+        self.edit_rf_price.setMinimumWidth(70)
+        self.edit_rf_price.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Fixed)
+        rf_row2a.addWidget(self.edit_rf_price)
+        rf_layout.addLayout(rf_row2a)
+        # Row 2b: update SL button (full width)
+        self.btn_rf_update = QPushButton("📍 Update SL Price")
+        self.btn_rf_update.setMinimumHeight(26)
         self.btn_rf_update.setEnabled(False)
-        self.btn_rf_update.setToolTip("Move the SL exit price while RF is active")
+        self.btn_rf_update.setToolTip(
+            "Move the SL exit price while RF is active")
         self.btn_rf_update.clicked.connect(self._update_rf_sl)
-        rf_row2.addWidget(self.btn_rf_update)
-        rf_row2.addStretch()
-        rf_layout.addLayout(rf_row2)
+        rf_layout.addWidget(self.btn_rf_update)
 
         # Row 3: Activate button
         self.btn_rf = QPushButton("🛡️  Activate Risk-Free")
@@ -351,51 +587,74 @@ class GUI(QMainWindow):
         vl.addWidget(grp2)
 
         # ── Levels table ─────────────────────────────────────────
-        grp3 = QGroupBox("Detected Levels"); ll = QVBoxLayout(grp3)
+        grp3 = QGroupBox("Detected Levels")
+        ll = QVBoxLayout(grp3)
         self.lvl_tbl = QTableWidget(0, 3)
-        self.lvl_tbl.setHorizontalHeaderLabels(["Level","Price","Dist"])
+        self.lvl_tbl.setHorizontalHeaderLabels(["Level", "Price", "Dist"])
         self.lvl_tbl.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.lvl_tbl.setAlternatingRowColors(True)
         self.lvl_tbl.setEditTriggers(QTableWidget.NoEditTriggers)
         self.lvl_tbl.verticalHeader().setVisible(False)
         ll.addWidget(self.lvl_tbl)
         vl.addWidget(grp3, 1)
-        return w
+        scroll.setWidget(w)
+        return scroll
 
     def _right_panel(self):
-        w = QWidget(); vl = QVBoxLayout(w); vl.setSpacing(0); vl.setContentsMargins(4,0,0,0)
+        w = QWidget()
+        vl = QVBoxLayout(w)
+        vl.setSpacing(0)
+        vl.setContentsMargins(4, 0, 0, 0)
         self.tabs = QTabWidget()
         self.tabs.addTab(self._tab_log(),       "📋  Log")
         self.tabs.addTab(self._tab_orders(),    "📊  Orders")
-        self.tabs.addTab(self._tab_scoreboard(),"🏆  Scoreboard")
+        self.tabs.addTab(self._tab_scoreboard(), "🏆  Scoreboard")
         self.tabs.addTab(self._tab_backtest(),  "🔬  Backtest")
         self.tabs.addTab(self._tab_report(),    "📁  Session Report")
         vl.addWidget(self.tabs)
         return w
 
     def _tab_log(self):
-        w = QWidget(); vl = QVBoxLayout(w); vl.setContentsMargins(4,4,4,4)
-        self.log_view = QTextEdit(); self.log_view.setReadOnly(True)
+        w = QWidget()
+        vl = QVBoxLayout(w)
+        vl.setContentsMargins(4, 4, 4, 4)
+        self.log_view = QTextEdit()
+        self.log_view.setReadOnly(True)
         self.log_view.setLineWrapMode(QTextEdit.NoWrap)
         vl.addWidget(self.log_view)
-        btn = QPushButton("Clear"); btn.setFixedHeight(24); btn.clicked.connect(self.log_view.clear)
-        vl.addWidget(btn); return w
+        btn = QPushButton("Clear")
+        btn.setFixedHeight(24)
+        btn.clicked.connect(self.log_view.clear)
+        vl.addWidget(btn)
+        return w
 
     def _tab_orders(self):
-        w = QWidget(); vl = QVBoxLayout(w); vl.setContentsMargins(6,6,6,6); vl.setSpacing(6)
+        w = QWidget()
+        vl = QVBoxLayout(w)
+        vl.setContentsMargins(6, 6, 6, 6)
+        vl.setSpacing(6)
 
         # ── Summary bar ───────────────────────────────────────────
-        sum_row = QHBoxLayout(); sum_row.setSpacing(8)
+        sum_row = QHBoxLayout()
+        sum_row.setSpacing(8)
 
         def _mini_card(key, label, color):
             f = QFrame()
-            f.setStyleSheet(f"background:{C['card']};border:1px solid {C['border']};border-radius:6px;")
-            fv = QVBoxLayout(f); fv.setContentsMargins(8,4,8,4); fv.setSpacing(0)
-            lt = QLabel(label); lt.setStyleSheet(f"color:{C['txt3']};font-size:8px;font-weight:bold;")
+            f.setStyleSheet(
+                f"background:{C['card']};border:1px solid {C['border']};border-radius:6px;")
+            fv = QVBoxLayout(f)
+            fv.setContentsMargins(8, 4, 8, 4)
+            fv.setSpacing(0)
+            lt = QLabel(label)
+            lt.setStyleSheet(
+                f"color:{C['txt3']};font-size:8px;font-weight:bold;")
             lt.setAlignment(Qt.AlignCenter)
-            lv = QLabel("—"); lv.setStyleSheet(f"color:{color};font-size:15px;font-weight:bold;font-family:Consolas;")
+            lv = QLabel("—")
+            lv.setStyleSheet(
+                f"color:{color};font-size:15px;font-weight:bold;font-family:Consolas;")
             lv.setAlignment(Qt.AlignCenter)
-            fv.addWidget(lt); fv.addWidget(lv)
+            fv.addWidget(lt)
+            fv.addWidget(lv)
             self._ord_summary[key] = lv
             return f
 
@@ -404,7 +663,7 @@ class GUI(QMainWindow):
         sum_row.addWidget(_mini_card("active",   "ACTIVE",    C['gold']))
         sum_row.addWidget(_mini_card("buy_pos",  "BUY POS",   C['green']))
         sum_row.addWidget(_mini_card("sell_pos", "SELL POS",  C['red']))
-        sum_row.addWidget(_mini_card("total_pnl","OPEN P&L",  C['purple']))
+        sum_row.addWidget(_mini_card("total_pnl", "OPEN P&L",  C['purple']))
         sum_row.addWidget(_mini_card("rounds",   "ROUNDS",    C['txt2']))
         vl.addLayout(sum_row)
 
@@ -413,7 +672,7 @@ class GUI(QMainWindow):
         pv = QVBoxLayout(grp_pending)
         self.ord_pending = QTableWidget(0, 7)
         self.ord_pending.setHorizontalHeaderLabels(
-            ["Gen","Lvl","Type","Entry","SL","TP","Pips SL"])
+            ["Gen", "Lvl", "Type", "Entry", "SL", "TP", "Pips SL"])
         self.ord_pending.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.ord_pending.setAlternatingRowColors(True)
         self.ord_pending.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -427,7 +686,7 @@ class GUI(QMainWindow):
         av = QVBoxLayout(grp_active)
         self.ord_active = QTableWidget(0, 7)
         self.ord_active.setHorizontalHeaderLabels(
-            ["Gen","Lvl","Type","Entry","SL","TP","P&L"])
+            ["Gen", "Lvl", "Type", "Entry", "SL", "TP", "P&L"])
         self.ord_active.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.ord_active.setAlternatingRowColors(True)
         self.ord_active.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -449,20 +708,32 @@ class GUI(QMainWindow):
         return w
 
     def _tab_scoreboard(self):
-        w = QWidget(); vl = QVBoxLayout(w); vl.setContentsMargins(8,8,8,8); vl.setSpacing(8)
+        w = QWidget()
+        vl = QVBoxLayout(w)
+        vl.setContentsMargins(8, 8, 8, 8)
+        vl.setSpacing(8)
 
         # ── Summary cards row ─────────────────────────────────────
-        cards_row = QHBoxLayout(); cards_row.setSpacing(6)
+        cards_row = QHBoxLayout()
+        cards_row.setSpacing(6)
 
         def _card(key, label, color):
             card = QFrame()
-            card.setStyleSheet(f"background:{C['card']};border:1px solid {C['border']};border-radius:8px;")
-            cv = QVBoxLayout(card); cv.setContentsMargins(12,8,12,8); cv.setSpacing(2)
-            lt = QLabel(label); lt.setStyleSheet(f"color:{C['txt3']};font-size:9px;font-weight:bold;letter-spacing:1px;")
+            card.setStyleSheet(
+                f"background:{C['card']};border:1px solid {C['border']};border-radius:8px;")
+            cv = QVBoxLayout(card)
+            cv.setContentsMargins(12, 8, 12, 8)
+            cv.setSpacing(2)
+            lt = QLabel(label)
+            lt.setStyleSheet(
+                f"color:{C['txt3']};font-size:9px;font-weight:bold;letter-spacing:1px;")
             lt.setAlignment(Qt.AlignCenter)
-            lv = QLabel("—"); lv.setStyleSheet(f"color:{color};font-size:20px;font-weight:bold;font-family:Consolas;")
+            lv = QLabel("—")
+            lv.setStyleSheet(
+                f"color:{color};font-size:20px;font-weight:bold;font-family:Consolas;")
             lv.setAlignment(Qt.AlignCenter)
-            cv.addWidget(lt); cv.addWidget(lv)
+            cv.addWidget(lt)
+            cv.addWidget(lv)
             self._sb_cards[key] = lv
             return card
 
@@ -480,7 +751,7 @@ class GUI(QMainWindow):
         hl = QVBoxLayout(grp_hist)
         self.sb_history = QTableWidget(0, 7)
         self.sb_history.setHorizontalHeaderLabels(
-            ["Ticket","Type","Entry","Close","Pips","Profit","Time"])
+            ["Ticket", "Type", "Entry", "Close", "Pips", "Profit", "Time"])
         self.sb_history.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.sb_history.setAlternatingRowColors(True)
         self.sb_history.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -505,21 +776,23 @@ class GUI(QMainWindow):
         """Pull closed deals from MT5 and update scoreboard."""
         try:
             import MetaTrader5 as _mt5
-            if not _mt5.initialize(): return
+            if not _mt5.initialize():
+                return
             _mt5.login(MT5_LOGIN, password=MT5_PASSWORD, server=MT5_SERVER)
 
             acc = _mt5.account_info()
-            if not acc: return
+            if not acc:
+                return
 
             cur_bal = acc.balance
-            equity  = acc.equity
+            equity = acc.equity
 
             # Start balance — store once
             if not hasattr(self, "_start_balance"):
                 self._start_balance = cur_bal
 
             start_bal = self._start_balance
-            pnl       = cur_bal - start_bal
+            pnl = cur_bal - start_bal
 
             # Get closed deals (history) for this magic number
             from datetime import datetime, timezone, timedelta
@@ -532,16 +805,16 @@ class GUI(QMainWindow):
                     if d.magic == MAGIC_NUMBER and d.entry == 1:  # entry=1 means close/out deal
                         bot_deals.append(d)
 
-            wins   = sum(1 for d in bot_deals if d.profit > 0)
+            wins = sum(1 for d in bot_deals if d.profit > 0)
             losses = sum(1 for d in bot_deals if d.profit < 0)
-            total  = wins + losses
-            ratio  = f"{wins/total*100:.0f}%" if total > 0 else "—"
+            total = wins + losses
+            ratio = f"{wins/total*100:.0f}%" if total > 0 else "—"
 
             # Update cards
             self._sb_cards["start_bal"].setText(f"${start_bal:.2f}")
             self._sb_cards["cur_bal"].setText(f"${cur_bal:.2f}")
             pnl_color = C['green'] if pnl >= 0 else C['red']
-            self._sb_cards["pnl"].setText(f"{'+'if pnl>=0 else ''}{pnl:.2f}")
+            self._sb_cards["pnl"].setText(f"{'+'if pnl >= 0 else ''}{pnl:.2f}")
             self._sb_cards["pnl"].setStyleSheet(
                 f"color:{pnl_color};font-size:20px;font-weight:bold;font-family:Consolas;")
             self._sb_cards["wins"].setText(str(wins))
@@ -556,9 +829,11 @@ class GUI(QMainWindow):
                 row = self.sb_history.rowCount()
                 self.sb_history.insertRow(row)
                 t = "BUY" if d.type == 0 else "SELL"
-                pips_val = d.profit / (LOT_SIZE * pip * 100000) if pip > 0 else 0
+                pips_val = d.profit / \
+                    (LOT_SIZE * pip * 100000) if pip > 0 else 0
                 clr = QColor(C['green'] if d.profit > 0 else C['red'])
-                close_time = datetime.fromtimestamp(d.time).strftime("%m-%d %H:%M")
+                close_time = datetime.fromtimestamp(
+                    d.time).strftime("%m-%d %H:%M")
                 vals = [str(d.deal), t, f"{d.price:.5f}",
                         f"{d.price:.5f}", f"{pips_val:+.1f}",
                         f"{d.profit:+.2f}", close_time]
@@ -571,54 +846,82 @@ class GUI(QMainWindow):
             pass  # Scoreboard refresh errors are non-critical
 
     def _tab_backtest(self):
-        w = QWidget(); vl = QVBoxLayout(w); vl.setContentsMargins(8,8,8,8); vl.setSpacing(6)
+        w = QWidget()
+        vl = QVBoxLayout(w)
+        vl.setContentsMargins(8, 8, 8, 8)
+        vl.setSpacing(6)
 
         # ── Settings ──────────────────────────────────────────────
-        grp_set = QGroupBox("Settings"); sl = QHBoxLayout(grp_set); sl.setSpacing(10)
+        grp_set = QGroupBox("Settings")
+        sl = QHBoxLayout(grp_set)
+        sl.setSpacing(10)
         sl.addWidget(QLabel("Symbol:"))
         self.bt_symbol = QComboBox()
         self.bt_symbol.setEditable(True)
-        self.bt_symbol.addItems([WATCH_SYMBOL, "EURUSD", "GBPUSD", "US30", "NAS100", "XAUUSD"])
+        self.bt_symbol.addItems(
+            [WATCH_SYMBOL, "EURUSD", "GBPUSD", "US30", "NAS100", "XAUUSD"])
         self.bt_symbol.setCurrentText(WATCH_SYMBOL)
         self.bt_symbol.setFixedWidth(110)
         sl.addWidget(self.bt_symbol)
         sl.addWidget(QLabel("TF:"))
-        self.bt_tf = QComboBox(); self.bt_tf.addItems(["M1","M5","M15","H1","H4"])
-        self.bt_tf.setCurrentText("M5"); sl.addWidget(self.bt_tf)
+        self.bt_tf = QComboBox()
+        self.bt_tf.addItems(["M1", "M5", "M15", "H1", "H4"])
+        self.bt_tf.setCurrentText("M5")
+        sl.addWidget(self.bt_tf)
         sl.addWidget(QLabel("Days:"))
-        self.bt_days = QSpinBox(); self.bt_days.setRange(1,30); self.bt_days.setValue(5)
+        self.bt_days = QSpinBox()
+        self.bt_days.setRange(1, 30)
+        self.bt_days.setValue(5)
         sl.addWidget(self.bt_days)
         sl.addWidget(QLabel("RR:"))
-        self.bt_rr = QDoubleSpinBox(); self.bt_rr.setRange(0.5,10.0)
-        self.bt_rr.setValue(TP_RR_RATIO); self.bt_rr.setSingleStep(0.5); self.bt_rr.setDecimals(1)
+        self.bt_rr = QDoubleSpinBox()
+        self.bt_rr.setRange(0.5, 10.0)
+        self.bt_rr.setValue(TP_RR_RATIO)
+        self.bt_rr.setSingleStep(0.5)
+        self.bt_rr.setDecimals(1)
         sl.addWidget(self.bt_rr)
         sl.addStretch()
-        self.btn_bt = QPushButton("▶  Run"); self.btn_bt.setObjectName("btn_bt")
-        self.btn_bt.setMinimumHeight(30); self.btn_bt.clicked.connect(self._run_backtest)
+        self.btn_bt = QPushButton("▶  Run")
+        self.btn_bt.setObjectName("btn_bt")
+        self.btn_bt.setMinimumHeight(30)
+        self.btn_bt.clicked.connect(self._run_backtest)
         sl.addWidget(self.btn_bt)
         vl.addWidget(grp_set)
 
         # ── Summary cards ─────────────────────────────────────────
-        grp_sum = QGroupBox("Summary"); hs = QHBoxLayout(grp_sum)
+        grp_sum = QGroupBox("Summary")
+        hs = QHBoxLayout(grp_sum)
         self._bt_cards = {}
         for key, label, color in [
-            ("candles","Candles",C['txt2']),("triggered","Triggered",C['cyan']),
-            ("wins","Wins",C['green']),("losses","Losses",C['red']),
-            ("winrate","Win%",C['gold']),("pips","Pips",C['purple']),
+            ("candles", "Candles", C['txt2']
+             ), ("triggered", "Triggered", C['cyan']),
+            ("wins", "Wins", C['green']), ("losses", "Losses", C['red']),
+            ("winrate", "Win%", C['gold']), ("pips", "Pips", C['purple']),
         ]:
             card = QFrame()
-            card.setStyleSheet(f"background:{C['card']};border:1px solid {C['border']};border-radius:6px;")
-            cv = QVBoxLayout(card); cv.setContentsMargins(8,4,8,4); cv.setSpacing(1)
-            lt = QLabel(label); lt.setStyleSheet(f"color:{C['txt3']};font-size:9px;font-weight:bold;")
-            lv = QLabel("—"); lv.setStyleSheet(f"color:{color};font-size:16px;font-weight:bold;font-family:Consolas;")
+            card.setStyleSheet(
+                f"background:{C['card']};border:1px solid {C['border']};border-radius:6px;")
+            cv = QVBoxLayout(card)
+            cv.setContentsMargins(8, 4, 8, 4)
+            cv.setSpacing(1)
+            lt = QLabel(label)
+            lt.setStyleSheet(
+                f"color:{C['txt3']};font-size:9px;font-weight:bold;")
+            lv = QLabel("—")
+            lv.setStyleSheet(
+                f"color:{color};font-size:16px;font-weight:bold;font-family:Consolas;")
             lv.setAlignment(Qt.AlignCenter)
-            cv.addWidget(lt); cv.addWidget(lv)
-            self._bt_cards[key] = lv; hs.addWidget(card)
+            cv.addWidget(lt)
+            cv.addWidget(lv)
+            self._bt_cards[key] = lv
+            hs.addWidget(card)
         vl.addWidget(grp_sum)
 
         # ── Progress / loading ────────────────────────────────────
-        self.bt_progress = QProgressBar(); self.bt_progress.setVisible(False)
-        self.bt_progress.setFixedHeight(6); self.bt_progress.setTextVisible(False)
+        self.bt_progress = QProgressBar()
+        self.bt_progress.setVisible(False)
+        self.bt_progress.setFixedHeight(6)
+        self.bt_progress.setTextVisible(False)
         vl.addWidget(self.bt_progress)
 
         # ── Candle chart ──────────────────────────────────────────
@@ -627,22 +930,26 @@ class GUI(QMainWindow):
 
         # ── Candle replay player ──────────────────────────────────
         grp_replay = QGroupBox("Playback & Orders")
-        rl = QVBoxLayout(grp_replay); rl.setSpacing(4)
+        rl = QVBoxLayout(grp_replay)
+        rl.setSpacing(4)
 
         # Bar info row
         bar_info_row = QHBoxLayout()
         self.bt_bar_lbl = QLabel("Bar: — / —")
-        self.bt_bar_lbl.setStyleSheet(f"color:{C['cyan']};font-family:Consolas;font-size:11px;")
+        self.bt_bar_lbl.setStyleSheet(
+            f"color:{C['cyan']};font-family:Consolas;font-size:11px;")
         bar_info_row.addWidget(self.bt_bar_lbl)
         bar_info_row.addStretch()
         self.bt_price_lbl = QLabel("O:— H:— L:— C:—")
-        self.bt_price_lbl.setStyleSheet(f"color:{C['txt2']};font-family:Consolas;font-size:11px;")
+        self.bt_price_lbl.setStyleSheet(
+            f"color:{C['txt2']};font-family:Consolas;font-size:11px;")
         bar_info_row.addWidget(self.bt_price_lbl)
         rl.addLayout(bar_info_row)
 
         # Slider
         self.bt_slider = QSlider(Qt.Horizontal)
-        self.bt_slider.setMinimum(0); self.bt_slider.setMaximum(0)
+        self.bt_slider.setMinimum(0)
+        self.bt_slider.setMaximum(0)
         self.bt_slider.valueChanged.connect(self._on_bt_slider)
         self.bt_slider.setStyleSheet(f"""
             QSlider::groove:horizontal {{
@@ -660,28 +967,41 @@ class GUI(QMainWindow):
 
         # Playback controls
         ctrl_row = QHBoxLayout()
-        self.btn_bt_first = QPushButton("⏮"); self.btn_bt_first.setFixedWidth(36)
+        self.btn_bt_first = QPushButton("⏮")
+        self.btn_bt_first.setFixedWidth(36)
         self.btn_bt_first.clicked.connect(lambda: self.bt_slider.setValue(0))
-        self.btn_bt_prev  = QPushButton("◀"); self.btn_bt_prev.setFixedWidth(36)
-        self.btn_bt_prev.clicked.connect(lambda: self.bt_slider.setValue(max(0, self.bt_slider.value()-1)))
-        self.btn_bt_play  = QPushButton("▶ Play"); self.btn_bt_play.setFixedWidth(72)
-        self.btn_bt_play.setCheckable(True); self.btn_bt_play.clicked.connect(self._bt_play_toggle)
-        self.btn_bt_next  = QPushButton("▶"); self.btn_bt_next.setFixedWidth(36)
-        self.btn_bt_next.clicked.connect(lambda: self.bt_slider.setValue(min(self.bt_slider.maximum(), self.bt_slider.value()+1)))
-        self.btn_bt_last  = QPushButton("⏭"); self.btn_bt_last.setFixedWidth(36)
-        self.btn_bt_last.clicked.connect(lambda: self.bt_slider.setValue(self.bt_slider.maximum()))
-        self.bt_speed = QComboBox(); self.bt_speed.addItems(["0.5×","1×","2×","5×","10×"])
-        self.bt_speed.setCurrentText("1×"); self.bt_speed.setFixedWidth(60)
+        self.btn_bt_prev = QPushButton("◀")
+        self.btn_bt_prev.setFixedWidth(36)
+        self.btn_bt_prev.clicked.connect(
+            lambda: self.bt_slider.setValue(max(0, self.bt_slider.value()-1)))
+        self.btn_bt_play = QPushButton("▶ Play")
+        self.btn_bt_play.setFixedWidth(72)
+        self.btn_bt_play.setCheckable(True)
+        self.btn_bt_play.clicked.connect(self._bt_play_toggle)
+        self.btn_bt_next = QPushButton("▶")
+        self.btn_bt_next.setFixedWidth(36)
+        self.btn_bt_next.clicked.connect(lambda: self.bt_slider.setValue(
+            min(self.bt_slider.maximum(), self.bt_slider.value()+1)))
+        self.btn_bt_last = QPushButton("⏭")
+        self.btn_bt_last.setFixedWidth(36)
+        self.btn_bt_last.clicked.connect(
+            lambda: self.bt_slider.setValue(self.bt_slider.maximum()))
+        self.bt_speed = QComboBox()
+        self.bt_speed.addItems(["0.5×", "1×", "2×", "5×", "10×"])
+        self.bt_speed.setCurrentText("1×")
+        self.bt_speed.setFixedWidth(60)
         for b in [self.btn_bt_first, self.btn_bt_prev, self.btn_bt_play,
                   self.btn_bt_next, self.btn_bt_last]:
             ctrl_row.addWidget(b)
-        ctrl_row.addWidget(QLabel("Speed:")); ctrl_row.addWidget(self.bt_speed)
+        ctrl_row.addWidget(QLabel("Speed:"))
+        ctrl_row.addWidget(self.bt_speed)
         ctrl_row.addStretch()
         rl.addLayout(ctrl_row)
 
         # Order state grid — shows each order's state at current bar
         self.bt_order_grid = QTableWidget(0, 6)
-        self.bt_order_grid.setHorizontalHeaderLabels(["Gen","Lvl","Type","Entry","SL/TP","State"])
+        self.bt_order_grid.setHorizontalHeaderLabels(
+            ["Gen", "Lvl", "Type", "Entry", "SL/TP", "State"])
         self.bt_order_grid.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.bt_order_grid.setAlternatingRowColors(True)
         self.bt_order_grid.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -700,29 +1020,37 @@ class GUI(QMainWindow):
 
     def _status_bar(self):
         w = QFrame()
-        w.setStyleSheet(f"background:{C['panel']};border:1px solid {C['border']};border-radius:4px;")
-        hl = QHBoxLayout(w); hl.setContentsMargins(10,4,10,4)
+        w.setStyleSheet(
+            f"background:{C['panel']};border:1px solid {C['border']};border-radius:4px;")
+        hl = QHBoxLayout(w)
+        hl.setContentsMargins(10, 4, 10, 4)
         self.lbl_obj_count = QLabel("Objects: —")
         self.lbl_obj_count.setStyleSheet(f"color:{C['txt2']};font-size:10px;")
-        hl.addWidget(self.lbl_obj_count); hl.addStretch()
+        hl.addWidget(self.lbl_obj_count)
+        hl.addStretch()
         self.lbl_auto = QLabel("Auto-hidden: —")
         self.lbl_auto.setStyleSheet(f"color:{C['txt3']};font-size:10px;")
-        hl.addWidget(self.lbl_auto); return w
+        hl.addWidget(self.lbl_auto)
+        return w
 
     def _vline(self):
-        f = QFrame(); f.setFrameShape(QFrame.VLine); return f
+        f = QFrame()
+        f.setFrameShape(QFrame.VLine)
+        return f
 
     # ─────────────────────────────── SLOTS ───────────────────────
 
     def _init_mt5_price(self):
         try:
             if not mt5.initialize():
-                self._on_log(f"{datetime.now().strftime('%H:%M:%S')}  ⚠️  MT5 not running — open MetaTrader 5 first", "WARN")
+                self._on_log(
+                    f"{datetime.now().strftime('%H:%M:%S')}  ⚠️  MT5 not running — open MetaTrader 5 first", "WARN")
                 return
             ok = mt5.login(MT5_LOGIN, password=MT5_PASSWORD, server=MT5_SERVER)
             if not ok:
                 err = mt5.last_error()
-                self._on_log(f"{datetime.now().strftime('%H:%M:%S')}  ⚠️  MT5 login failed: {err} | Check config.py credentials", "WARN")
+                self._on_log(
+                    f"{datetime.now().strftime('%H:%M:%S')}  ⚠️  MT5 login failed: {err} | Check config.py credentials", "WARN")
                 return
             # Symbol combos pre-populated with common symbols
         except Exception:
@@ -731,67 +1059,80 @@ class GUI(QMainWindow):
     def _start(self):
         self._pip_step = self.spin_pip.value()
         self.spin_pip.setEnabled(False)
-        active_sym   = self.sym_combo.currentText().strip() or WATCH_SYMBOL
-        self._tp_pips    = self.spin_tp.value()
+        active_sym = self.sym_combo.currentText().strip() or WATCH_SYMBOL
+        self._tp_pips = self.spin_tp.value()
         self._spawn_lvls = self.combo_spawn.currentText()
-        self._lot_size   = self.spin_lot.value()
+        self._lot_size = self.spin_lot.value()
         self._worker = WatcherWorker(self._sig, self._pip_step, symbol=active_sym,
-                                      tp_pips=self._tp_pips, spawn_on=self._spawn_lvls,
-                                      lot_size=self._lot_size)
+                                     tp_pips=self._tp_pips, spawn_on=self._spawn_lvls,
+                                     lot_size=self._lot_size)
         self._worker.follow_enabled = self.chk_follow.isChecked()
         self._worker.start()
-        self.btn_start.setEnabled(False); self.btn_stop.setEnabled(True)
+        self.btn_start.setEnabled(False)
+        self.btn_stop.setEnabled(True)
         self.chk_follow.stateChanged.connect(self._toggle_follow)
-        self._on_log(f"{datetime.now().strftime('%H:%M:%S')}  ▶ Watcher started | symbol={active_sym} | pip_step={self._pip_step}", "INFO")
-        self._on_log(f"{datetime.now().strftime('%H:%M:%S')}  💡 Make sure ObjectExporter EA is on the {active_sym} chart in MT5", "INFO")
+        self._on_log(
+            f"{datetime.now().strftime('%H:%M:%S')}  ▶ Watcher started | symbol={active_sym} | pip_step={self._pip_step}", "INFO")
+        self._on_log(
+            f"{datetime.now().strftime('%H:%M:%S')}  💡 Make sure ObjectExporter EA is on the {active_sym} chart in MT5", "INFO")
 
     def _toggle_follow(self, state):
         if self._worker:
             self._worker.follow_enabled = bool(state)
             status = "enabled" if state else "locked"
-            self._on_log(f"{datetime.now().strftime('%H:%M:%S')}  🔗 Follow object: {status}", "INFO")
+            self._on_log(
+                f"{datetime.now().strftime('%H:%M:%S')}  🔗 Follow object: {status}", "INFO")
 
     def _on_symbol_changed(self, sym: str):
         sym = sym.strip()
-        if not sym: return
+        if not sym:
+            return
         # Update header label
         self.lbl_sym.setText(sym)
         # Sync backtest symbol combo
         if hasattr(self, "bt_symbol"):
             self.bt_symbol.setCurrentText(sym)
-        self._on_log(f"{datetime.now().strftime('%H:%M:%S')}  🔄 Symbol changed to {sym}", "INFO")
+        self._on_log(
+            f"{datetime.now().strftime('%H:%M:%S')}  🔄 Symbol changed to {sym}", "INFO")
 
     def _stop(self):
-        if self._worker: self._worker.stop(); self._worker = None
-        self.btn_start.setEnabled(True); self.btn_stop.setEnabled(False)
-        self.btn_place.setEnabled(False); self.spin_pip.setEnabled(True)
+        if self._worker:
+            self._worker.stop()
+            self._worker = None
+        self.btn_start.setEnabled(True)
+        self.btn_stop.setEnabled(False)
+        self.btn_place.setEnabled(False)
+        self.spin_pip.setEnabled(True)
 
     def _place_orders(self):
         if not self.btn_place.isEnabled():
             return  # guard against spurious calls
-        pip = get_pip_size(self.sym_combo.currentText().strip() or WATCH_SYMBOL)
+        pip = get_pip_size(
+            self.sym_combo.currentText().strip() or WATCH_SYMBOL)
         all_orders = []
 
         hlines = [o for o in self._trader_objects if o.is_hline]
-        rects  = [o for o in self._trader_objects if o.is_rectangle]
+        rects = [o for o in self._trader_objects if o.is_rectangle]
 
         if hlines:
             # Hline: 3 buy-stops above, 3 sell-stops below
             _sym = self.sym_combo.currentText().strip() or WATCH_SYMBOL
-            orders = place_level_orders(hlines[0].price1, pip, self._pip_step, _sym)
+            orders = place_level_orders(
+                hlines[0].price1, pip, self._pip_step, _sym)
             all_orders.extend(orders)
 
         elif rects:
             # Rectangle: buy-stops above TOP edge, sell-stops below BOTTOM edge
             rect = next((r for r in rects if r.rect_valid), None)
             if rect is None:
-                self._on_log(f"{datetime.now().strftime('%H:%M:%S')}  ⚠️  Rectangle not fully drawn yet", "WARN")
+                self._on_log(
+                    f"{datetime.now().strftime('%H:%M:%S')}  ⚠️  Rectangle not fully drawn yet", "WARN")
                 return
             step = self._pip_step * pip
-            top    = rect.rect_top
+            top = rect.rect_top
             bottom = rect.rect_bottom
-            above  = [top    + step * i for i in range(1, 4)]
-            below  = [bottom - step * i for i in range(1, 4)]
+            above = [top + step * i for i in range(1, 4)]
+            below = [bottom - step * i for i in range(1, 4)]
             for i in range(3):
                 sl_dist = above[i] - below[i]
                 all_orders.append({
@@ -810,24 +1151,30 @@ class GUI(QMainWindow):
                 })
 
         if not all_orders:
-            self._on_log(f"{datetime.now().strftime('%H:%M:%S')}  ⚠️  No line or rectangle detected", "WARN")
+            self._on_log(
+                f"{datetime.now().strftime('%H:%M:%S')}  ⚠️  No line or rectangle detected", "WARN")
             return
 
         self.btn_place.setEnabled(False)
         self._populate_ord_table(all_orders)
-        results = send_orders(all_orders, self.sym_combo.currentText().strip() or WATCH_SYMBOL)
-        ok      = sum(1 for r in results if r["ok"])
-        failed  = [r for r in results if not r["ok"]]
-        ts      = datetime.now().strftime('%H:%M:%S')
+        results = send_orders(
+            all_orders, self.sym_combo.currentText().strip() or WATCH_SYMBOL)
+        ok = sum(1 for r in results if r["ok"])
+        failed = [r for r in results if not r["ok"]]
+        ts = datetime.now().strftime('%H:%M:%S')
         if ok == len(results):
             self._on_log(f"{ts}  ✅ All {ok} orders placed successfully", "NEW")
         elif ok > 0:
-            self._on_log(f"{ts}  ⚠️  {ok}/{len(results)} placed — {failed[0].get('reason','unknown')}", "WARN")
+            self._on_log(
+                f"{ts}  ⚠️  {ok}/{len(results)} placed — {failed[0].get('reason', 'unknown')}", "WARN")
         else:
-            reason = failed[0].get('reason', 'unknown') if failed else 'unknown'
-            self._on_log(f"{ts}  ❌ 0/{len(results)} placed — {reason}", "ERROR")
+            reason = failed[0].get(
+                'reason', 'unknown') if failed else 'unknown'
+            self._on_log(
+                f"{ts}  ❌ 0/{len(results)} placed — {reason}", "ERROR")
             if "Market closed" in reason:
-                self._on_log(f"{ts}  💡 Use the Backtest tab to test while market is closed", "INFO")
+                self._on_log(
+                    f"{ts}  💡 Use the Backtest tab to test while market is closed", "INFO")
         self.btn_place.setEnabled(True)
         self.tabs.setCurrentIndex(1)
 
@@ -835,7 +1182,8 @@ class GUI(QMainWindow):
         """Pull live pending + active orders from MT5 and update the Orders tab."""
         try:
             import MetaTrader5 as _mt5
-            if not _mt5.initialize(): return
+            if not _mt5.initialize():
+                return
             sym = self.sym_combo.currentText().strip() or WATCH_SYMBOL
             pip = get_pip_size(sym)
 
@@ -845,22 +1193,26 @@ class GUI(QMainWindow):
 
             self.ord_pending.setRowCount(0)
             for o in sorted(bot_pending, key=lambda x: x.price_open):
-                cmt  = getattr(o, 'comment', '')
+                cmt = getattr(o, 'comment', '')
                 # Parse Gen/Lvl from comment e.g. TB_G0L1B
                 gen_str = "?"
                 lvl_str = "?"
                 import re
                 m = re.search(r'G(\d+)L(\d+)', cmt)
-                if m: gen_str, lvl_str = m.group(1), m.group(2)
+                if m:
+                    gen_str, lvl_str = m.group(1), m.group(2)
                 is_buy = o.type == 2  # ORDER_TYPE_BUY_STOP = 2
-                t_str  = "BUY_STOP" if is_buy else "SELL_STOP"
-                clr    = QColor(C['green'] if is_buy else C['red'])
+                t_str = "BUY_STOP" if is_buy else "SELL_STOP"
+                clr = QColor(C['green'] if is_buy else C['red'])
                 sl_pips = abs(o.price_open - o.sl) / pip if pip > 0 else 0
                 row = self.ord_pending.rowCount()
                 self.ord_pending.insertRow(row)
-                gen_colors = [C['gold'], C['cyan'], C['purple'], C['orange'], C['orange']]
-                try: gc = QColor(gen_colors[int(gen_str)])
-                except: gc = QColor(C['txt2'])
+                gen_colors = [C['gold'], C['cyan'],
+                              C['purple'], C['orange'], C['orange']]
+                try:
+                    gc = QColor(gen_colors[int(gen_str)])
+                except:
+                    gc = QColor(C['txt2'])
                 vals = [f"G{gen_str}", f"L{lvl_str}", t_str,
                         f"{o.price_open:.5f}", f"{o.sl:.5f}",
                         f"{o.tp:.5f}" if o.tp > 0 else "—",
@@ -870,12 +1222,13 @@ class GUI(QMainWindow):
                     it.setForeground(gc if c == 0 else clr)
                     # Highlight L1 rows slightly
                     if lvl_str == "1":
-                        it.setBackground(QColor("#1A2520" if is_buy else "#251A1A"))
+                        it.setBackground(
+                            QColor("#1A2520" if is_buy else "#251A1A"))
                     self.ord_pending.setItem(row, c, it)
 
             # ── Active positions ──────────────────────────────────
             positions = _mt5.positions_get(symbol=sym) or []
-            bot_pos   = [p for p in positions if p.magic == MAGIC_NUMBER]
+            bot_pos = [p for p in positions if p.magic == MAGIC_NUMBER]
 
             self.ord_active.setRowCount(0)
             total_pnl = 0.0
@@ -885,11 +1238,14 @@ class GUI(QMainWindow):
                 gen_str = lvl_str = "?"
                 import re
                 m = re.search(r'G(\d+)L(\d+)', cmt)
-                if m: gen_str, lvl_str = m.group(1), m.group(2)
+                if m:
+                    gen_str, lvl_str = m.group(1), m.group(2)
                 is_buy = p.type == 0
-                t_str  = "BUY" if is_buy else "SELL"
-                if is_buy: buy_count  += 1
-                else:      sell_count += 1
+                t_str = "BUY" if is_buy else "SELL"
+                if is_buy:
+                    buy_count += 1
+                else:
+                    sell_count += 1
                 total_pnl += p.profit
                 pnl_clr = QColor(C['green'] if p.profit >= 0 else C['red'])
                 row_clr = QColor(C['green'] if is_buy else C['red'])
@@ -903,9 +1259,12 @@ class GUI(QMainWindow):
                     it = QTableWidgetItem(v)
                     it.setForeground(pnl_clr if c == 6 else row_clr)
                     if c == 0:
-                        gen_colors = [C['gold'], C['cyan'], C['purple'], C['orange'], C['orange']]
-                        try: it.setForeground(QColor(gen_colors[int(gen_str)]))
-                        except: pass
+                        gen_colors = [C['gold'], C['cyan'],
+                                      C['purple'], C['orange'], C['orange']]
+                        try:
+                            it.setForeground(QColor(gen_colors[int(gen_str)]))
+                        except:
+                            pass
                     self.ord_active.setItem(row, c, it)
 
             # ── Summary cards ─────────────────────────────────────
@@ -918,12 +1277,14 @@ class GUI(QMainWindow):
                 self._ord_summary["total_pnl"].setText(f"{total_pnl:+.2f}")
                 self._ord_summary["total_pnl"].setStyleSheet(
                     f"color:{pnl_color};font-size:15px;font-weight:bold;font-family:Consolas;")
-                rounds = getattr(self._worker, 'spawn_rounds', 0) if self._worker else 0
+                rounds = getattr(self._worker, 'spawn_rounds',
+                                 0) if self._worker else 0
                 self._ord_summary["rounds"].setText(str(rounds))
 
             # ── Tab title with count ──────────────────────────────
             total = len(bot_pending) + len(bot_pos)
-            self.tabs.setTabText(1, f"📊  Orders ({total})" if total else "📊  Orders")
+            self.tabs.setTabText(
+                1, f"📊  Orders ({total})" if total else "📊  Orders")
             # Update group box titles with counts
             self.ord_pending.parent().parent().setTitle(
                 f"🔵  Pending Orders ({len(bot_pending)})")
@@ -932,6 +1293,86 @@ class GUI(QMainWindow):
 
         except Exception as e:
             pass  # Non-critical refresh failure
+
+    def _refresh_rf_advisor(self):
+        """Calculate and display the 3 suggested SL levels based on live positions."""
+        try:
+            import MetaTrader5 as _mt5
+            sym = self.sym_combo.currentText().strip() or WATCH_SYMBOL
+            pip = get_pip_size(sym)
+            keep_side = "BUY" if "BUY" in self.combo_rf_side.currentText() else "SELL"
+
+            positions = _mt5.positions_get(symbol=sym) or []
+            keep_pos = [p for p in positions
+                        if p.magic == MAGIC_NUMBER and
+                        ((p.type == 0) == (keep_side == "BUY"))]
+
+            # Reset
+            for k in self._rf_suggestions:
+                self._rf_suggestions[k]["label"].setText("—")
+                self._rf_suggestions[k]["value"] = None
+
+            if not keep_pos:
+                self.lbl_rf_pos_summary.setText(
+                    f"No {keep_side} positions found — start watcher and place orders first")
+                return
+
+            entries = sorted([p.price_open for p in keep_pos],
+                             reverse=(keep_side == "BUY"))
+            # For BUY: sorted descending → entries[0] = best (highest entry if price went up)
+            # For SELL: sorted ascending → entries[0] = best (lowest entry if price went down)
+            # Actually sort by current profit
+            keep_pos_sorted = sorted(
+                keep_pos, key=lambda p: p.profit, reverse=True)
+
+            # most profitable position
+            best_entry = keep_pos_sorted[0].price_open
+            # least profitable position
+            worst_entry = keep_pos_sorted[-1].price_open
+            avg_entry = sum(p.price_open for p in keep_pos) / len(keep_pos)
+            total_pnl = sum(p.profit for p in keep_pos)
+
+            # Buffer: 1 pip below entry for BUY (protects from spread noise)
+            buf = pip * 1.0
+
+            if keep_side == "BUY":
+                # Conservative: SL below worst (smallest profit) entry — ALL positions safe
+                safe_price = round(worst_entry - buf, 5)
+                # Balanced: SL at average entry
+                mid_price = round(avg_entry - buf, 5)
+                # Aggressive: SL just below BEST entry only
+                bold_price = round(best_entry - buf, 5)
+            else:  # SELL
+                safe_price = round(worst_entry + buf, 5)
+                mid_price = round(avg_entry + buf, 5)
+                bold_price = round(best_entry + buf, 5)
+
+            # Update suggestion labels and store values
+            self._rf_suggestions["safe"]["label"].setText(f"{safe_price:.5f}")
+            self._rf_suggestions["safe"]["value"] = safe_price
+            self._rf_suggestions["mid"]["label"].setText(f"{mid_price:.5f}")
+            self._rf_suggestions["mid"]["value"] = mid_price
+            self._rf_suggestions["bold"]["label"].setText(f"{bold_price:.5f}")
+            self._rf_suggestions["bold"]["value"] = bold_price
+
+            # Summary: show each position's entry and current P&L
+            lines = [
+                f"  {keep_side} positions ({len(keep_pos)}) | Total P&L: {total_pnl:+.2f}"]
+            for i, p in enumerate(keep_pos_sorted):
+                rank = "★" if i == 0 else (
+                    "▼" if i == len(keep_pos_sorted)-1 else "·")
+                lines.append(f"  {rank} #{p.ticket} entry={p.price_open:.5f} "
+                             f"P&L={p.profit:+.2f}")
+            self.lbl_rf_pos_summary.setText("\n".join(lines))
+
+        except Exception as e:
+            self.lbl_rf_pos_summary.setText(f"Error: {e}")
+
+    def _rf_use_suggestion(self, key: str):
+        """Copy a suggested SL price into the exit price field."""
+        val = self._rf_suggestions.get(key, {}).get("value")
+        if val is not None:
+            self.edit_rf_price.setText(f"{val:.5f}")
 
     def _activate_risk_free(self):
         """
@@ -950,11 +1391,14 @@ class GUI(QMainWindow):
         positions = _mt5.positions_get(symbol=sym) or []
         bot_pos = [p for p in positions if p.magic == MAGIC_NUMBER]
 
-        keep_pos  = [p for p in bot_pos if (p.type == 0) == (keep_side == "BUY")]
-        close_pos = [p for p in bot_pos if (p.type == 0) != (keep_side == "BUY")]
+        keep_pos = [p for p in bot_pos if (
+            p.type == 0) == (keep_side == "BUY")]
+        close_pos = [p for p in bot_pos if (
+            p.type == 0) != (keep_side == "BUY")]
 
         if not keep_pos:
-            self._on_log(f"{datetime.now().strftime('%H:%M:%S')}  ⚠️  No {keep_side} positions to protect", "WARN")
+            self._on_log(
+                f"{datetime.now().strftime('%H:%M:%S')}  ⚠️  No {keep_side} positions to protect", "WARN")
             return
 
         # Close opposite side
@@ -985,7 +1429,8 @@ class GUI(QMainWindow):
         cancelled = 0
         for o in pending:
             if o.magic == MAGIC_NUMBER:
-                res = _mt5.order_send({"action": _mt5.TRADE_ACTION_REMOVE, "order": o.ticket})
+                res = _mt5.order_send(
+                    {"action": _mt5.TRADE_ACTION_REMOVE, "order": o.ticket})
                 if res and res.retcode == _mt5.TRADE_RETCODE_DONE:
                     cancelled += 1
 
@@ -996,16 +1441,18 @@ class GUI(QMainWindow):
         except ValueError:
             sl_price = 0.0
         if sl_price <= 0:
-            sl_price = round(sum(p.price_open for p in keep_pos) / len(keep_pos), 5)
+            sl_price = round(
+                sum(p.price_open for p in keep_pos) / len(keep_pos), 5)
             self.edit_rf_price.setText(f"{sl_price:.5f}")
-        write_commands([f"DRAW_HLINE|TB_RF_SL|{sl_price:.5f}|{0xFFD700}|2|0"], symbol=sym)
+        write_commands(
+            [f"DRAW_HLINE|TB_RF_SL|{sl_price:.5f}|{0xFFD700}|2|0"], symbol=sym)
         avg_entry = sl_price
 
         # Store RF state for watcher to monitor
-        self._rf_active    = True
+        self._rf_active = True
         self._rf_keep_side = keep_side
-        self._rf_sym       = sym
-        self._rf_tickets   = [p.ticket for p in keep_pos]
+        self._rf_sym = sym
+        self._rf_tickets = [p.ticket for p in keep_pos]
 
         n_keep = len(keep_pos)
         ts = datetime.now().strftime("%H:%M:%S")
@@ -1015,7 +1462,8 @@ class GUI(QMainWindow):
             f"Gold SL line drawn @ {avg_entry:.5f} — DRAG IT in MT5 to set exit price", "NEW")
         self.lbl_rf_status.setText(
             f"🛡️ Active: {n_keep} {keep_side} | exit @ {avg_entry:.5f}")
-        self.lbl_rf_status.setStyleSheet(f"color:{C['gold']};font-size:10px;font-weight:bold;")
+        self.lbl_rf_status.setStyleSheet(
+            f"color:{C['gold']};font-size:10px;font-weight:bold;")
         self.btn_rf_update.setEnabled(True)
         self.btn_rf.setText("🛡️ RF Active")
         self.btn_rf.setEnabled(False)
@@ -1027,10 +1475,12 @@ class GUI(QMainWindow):
         try:
             new_price = float(self.edit_rf_price.text().strip())
         except ValueError:
-            self._on_log(f"{datetime.now().strftime('%H:%M:%S')}  ⚠️  Invalid price — enter a number like 1.16420", "WARN")
+            self._on_log(
+                f"{datetime.now().strftime('%H:%M:%S')}  ⚠️  Invalid price — enter a number like 1.16420", "WARN")
             return
         sym = self._rf_sym
-        write_commands([f"DRAW_HLINE|TB_RF_SL|{new_price:.5f}|{0xFFD700}|2|0"], symbol=sym)
+        write_commands(
+            [f"DRAW_HLINE|TB_RF_SL|{new_price:.5f}|{0xFFD700}|2|0"], symbol=sym)
         self._on_log(
             f"{datetime.now().strftime('%H:%M:%S')}  📍  RF exit price updated → {new_price:.5f}", "NEW")
         self.lbl_rf_status.setText(
@@ -1041,7 +1491,7 @@ class GUI(QMainWindow):
         if not getattr(self, "_rf_active", False):
             return
         import MetaTrader5 as _mt5
-        sym  = self._rf_sym
+        sym = self._rf_sym
         prev_h = candle.get("PREV_H", 0.0)
         prev_l = candle.get("PREV_L", 0.0)
 
@@ -1098,11 +1548,202 @@ class GUI(QMainWindow):
                 f"closed {closed} {self._rf_keep_side} positions with profit", "NEW")
             self._rf_active = False
             self.lbl_rf_status.setText("✅ Triggered — all positions closed")
-            self.lbl_rf_status.setStyleSheet(f"color:{C['cyan']};font-size:10px;")
+            self.lbl_rf_status.setStyleSheet(
+                f"color:{C['cyan']};font-size:10px;")
             self.btn_rf_update.setEnabled(False)
             self.btn_rf.setText("🛡️  Activate Risk-Free")
             self.btn_rf.setEnabled(True)
             write_commands(["DELETE|TB_RF_SL"], symbol=sym)
+
+    def _refresh_peak_pnl(self):
+        """Update the peak P&L dashboard every second."""
+        try:
+            import MetaTrader5 as _mt5
+            sym = self.sym_combo.currentText().strip() or WATCH_SYMBOL
+            positions = _mt5.positions_get(symbol=sym) or []
+            bot_pos = [p for p in positions if p.magic == MAGIC_NUMBER]
+
+            current_pnl = sum(p.profit for p in bot_pos)
+
+            # Update peak
+            if current_pnl > self._session_peak_pnl:
+                self._session_peak_pnl = current_pnl
+                self._session_peak_alerted = False  # reset alert for new peak
+
+            drawdown = self._session_peak_pnl - current_pnl
+            drawdown_pct = (drawdown / self._session_peak_pnl * 100
+                            if self._session_peak_pnl > 0 else 0)
+
+            # Color current P&L
+            cur_color = C['green'] if current_pnl >= 0 else C['red']
+            self._peak_cards["current"].setText(f"{current_pnl:+.2f}")
+            self._peak_cards["current"].setStyleSheet(
+                f"color:{cur_color};font-size:17px;font-weight:bold;font-family:Consolas;")
+
+            # Peak
+            peak_color = C['green'] if self._session_peak_pnl > 0 else C['txt3']
+            self._peak_cards["peak"].setText(f"{self._session_peak_pnl:+.2f}")
+            self._peak_cards["peak"].setStyleSheet(
+                f"color:{peak_color};font-size:17px;font-weight:bold;font-family:Consolas;")
+
+            # Drawdown from peak
+            if drawdown > 0:
+                dd_color = C['red'] if drawdown_pct > 20 else C['orange']
+                self._peak_cards["drawdown"].setText(
+                    f"-{drawdown:.2f} ({drawdown_pct:.0f}%)")
+                self._peak_cards["drawdown"].setStyleSheet(
+                    f"color:{dd_color};font-size:14px;font-weight:bold;font-family:Consolas;")
+            else:
+                self._peak_cards["drawdown"].setText("0.00")
+                self._peak_cards["drawdown"].setStyleSheet(
+                    f"color:{C['txt3']};font-size:17px;font-weight:bold;font-family:Consolas;")
+
+            # Status line
+            n_pos = len(bot_pos)
+            rounds = getattr(self._worker, 'spawn_rounds',
+                             0) if self._worker else 0
+            self.lbl_peak_status.setText(
+                f"{n_pos} positions open | Rounds: {rounds}/9 | "
+                f"Best: {self._session_peak_pnl:+.2f}")
+
+            # Alert check — fires ONCE per peak crossing
+            if (self.chk_alert.isChecked() and
+                    not self._session_peak_alerted and
+                    current_pnl >= self.spin_alert.value() and
+                    n_pos > 0):
+                self._session_peak_alerted = True
+                self._fire_pnl_alert(current_pnl)
+
+            # Flash background red if drawdown > 30% of peak (visual warning)
+            if drawdown_pct > 30 and self._session_peak_pnl > 5:
+                self.btn_close_reset.setStyleSheet(
+                    f"QPushButton {{ background:{C['red_dk']};color:{C['red']};"
+                    f"border:2px solid {C['red']};border-radius:5px;"
+                    f"font-weight:bold;font-size:13px; }}"
+                    f"QPushButton:hover {{ background:{C['red']};color:#fff; }}")
+            else:
+                self.btn_close_reset.setStyleSheet(
+                    f"QPushButton {{ background:#1A0A2A;color:{C['purple']};"
+                    f"border:2px solid {C['purple']};border-radius:5px;"
+                    f"font-weight:bold;font-size:13px; }}"
+                    f"QPushButton:hover {{ background:{C['purple']};color:#fff; }}")
+
+        except Exception:
+            pass
+
+    def _fire_pnl_alert(self, pnl: float):
+        """Flash GUI and play sound when P&L target is reached."""
+        import winsound
+        ts = datetime.now().strftime('%H:%M:%S')
+        self._on_log(
+            f"{ts}  🔔  P&L ALERT — ${pnl:+.2f} crossed target "
+            f"${self.spin_alert.value():.1f} — consider closing!", "NEW")
+        # Flash the peak panel gold
+        try:
+            self.btn_close_reset.setStyleSheet(
+                f"QPushButton {{ background:{C['gold']};color:#000;"
+                f"border:2px solid {C['gold']};border-radius:5px;"
+                f"font-weight:bold;font-size:13px; }}"
+                f"QPushButton:hover {{ background:{C['gold']};color:#000; }}")
+            # Simple beep — works on Windows
+            winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+        except Exception:
+            pass  # Non-Windows fallback — just the log message
+
+    def _close_all_and_reset(self):
+        """
+        One-click: close ALL open positions + cancel ALL pending orders
+        + reset watcher state (rounds, source registry, peak tracker).
+        """
+        from PyQt5.QtWidgets import QMessageBox
+        import MetaTrader5 as _mt5
+
+        sym = self.sym_combo.currentText().strip() or WATCH_SYMBOL
+
+        # Get current totals for confirmation dialog
+        positions = _mt5.positions_get(symbol=sym) or []
+        bot_pos = [p for p in positions if p.magic == MAGIC_NUMBER]
+        pending = _mt5.orders_get(symbol=sym) or []
+        bot_pend = [o for o in pending if o.magic == MAGIC_NUMBER]
+        total_pnl = sum(p.profit for p in bot_pos)
+
+        # Confirm
+        msg = (f"Close ALL {len(bot_pos)} open positions "
+               f"(P&L: {total_pnl:+.2f}) and cancel {len(bot_pend)} pending orders?\n\n"
+               f"Peak this session: ${self._session_peak_pnl:+.2f}\n"
+               f"You will receive: ~${total_pnl:+.2f}\n\n"
+               f"Bot state will be fully reset — you can draw a new line immediately.")
+        reply = QMessageBox.question(
+            self, "🏁 Close All & Reset", msg,
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+
+        ts = datetime.now().strftime('%H:%M:%S')
+        closed = cancelled = 0
+
+        # Close all open positions at market
+        for p in bot_pos:
+            close_type = _mt5.ORDER_TYPE_SELL if p.type == 0 else _mt5.ORDER_TYPE_BUY
+            tick = _mt5.symbol_info_tick(sym)
+            price = tick.bid if close_type == _mt5.ORDER_TYPE_SELL else tick.ask
+            req = {
+                "action":       _mt5.TRADE_ACTION_DEAL,
+                "symbol":       sym,
+                "volume":       p.volume,
+                "type":         close_type,
+                "position":     p.ticket,
+                "price":        price,
+                "deviation":    20,
+                "magic":        MAGIC_NUMBER,
+                "comment":      "TB_CLOSE_RESET",
+                "type_time":    _mt5.ORDER_TIME_GTC,
+                "type_filling": _mt5.ORDER_FILLING_RETURN,
+            }
+            res = _mt5.order_send(req)
+            if res and res.retcode == _mt5.TRADE_RETCODE_DONE:
+                closed += 1
+
+        # Cancel all pending
+        for o in bot_pend:
+            res = _mt5.order_send({
+                "action": _mt5.TRADE_ACTION_REMOVE,
+                "order":  o.ticket,
+            })
+            if res and res.retcode == _mt5.TRADE_RETCODE_DONE:
+                cancelled += 1
+
+        # Clear bot lines from MT5 chart
+        write_commands(["DELETE_PREFIX|TB_"], symbol=sym)
+
+        # Reset watcher state
+        if self._worker:
+            self._worker.spawn_rounds = 0
+            self._worker.spawned_keys = set()
+            self._worker.pending_tracker = {}
+            self._worker.drawn = {}
+            self._worker.prev_names = set()
+            self._worker.orders_placed = set()
+            self._worker.source_registry = {}
+            self._worker._source_registry = {}
+            self._worker._last_direction = "—"
+
+        # Reset peak tracker (keep session_peak for reference, reset for next trade)
+        last_peak = self._session_peak_pnl
+        self._session_peak_pnl = 0.0
+        self._session_peak_alerted = False
+
+        # Reset peak cards
+        for key in self._peak_cards:
+            self._peak_cards[key].setText("—")
+        self.lbl_peak_status.setText(
+            "Reset complete — draw a new line to start")
+
+        self._on_log(
+            f"{ts}  🏁  CLOSED {closed} positions | Cancelled {cancelled} pending | "
+            f"Locked: ~${total_pnl:+.2f} | Session peak was: ${last_peak:+.2f}", "NEW")
+        self._on_log(
+            f"{ts}  ✅  Bot state reset — draw a new line on the chart to begin next trade", "INFO")
 
     def _cancel_orders(self):
         if getattr(self, "_cancelling", False):
@@ -1112,17 +1753,24 @@ class GUI(QMainWindow):
             sym = self.sym_combo.currentText().strip() or WATCH_SYMBOL
             n = cancel_all_tb_orders(sym)
             write_commands(["DELETE_PREFIX|TB_"], symbol=sym)
-            self._on_log(f"{datetime.now().strftime('%H:%M:%S')}  🗑️  Cancelled {n} bot orders + cleared all level lines", "WARN")
-            if hasattr(self, 'ord_pending'): self.ord_pending.setRowCount(0)
-            if hasattr(self, 'ord_active'):  self.ord_active.setRowCount(0)
+            self._on_log(
+                f"{datetime.now().strftime('%H:%M:%S')}  🗑️  Cancelled {n} bot orders + cleared all level lines", "WARN")
+            if hasattr(self, 'ord_pending'):
+                self.ord_pending.setRowCount(0)
+            if hasattr(self, 'ord_active'):
+                self.ord_active.setRowCount(0)
         finally:
             self._cancelling = False
 
     def _tab_report(self):
-        w = QWidget(); vl = QVBoxLayout(w); vl.setContentsMargins(6,6,6,6); vl.setSpacing(6)
+        w = QWidget()
+        vl = QVBoxLayout(w)
+        vl.setContentsMargins(6, 6, 6, 6)
+        vl.setSpacing(6)
 
         # ── Summary cards ──────────────────────────────────────────
-        grp_sum = QGroupBox("Session Summary"); hs = QHBoxLayout(grp_sum)
+        grp_sum = QGroupBox("Session Summary")
+        hs = QHBoxLayout(grp_sum)
         self._rpt_cards = {}
         for key, label, color in [
             ("duration",  "Duration",    C["txt2"]),
@@ -1135,13 +1783,21 @@ class GUI(QMainWindow):
             ("worst",     "Worst P&L",   C["red"]),
         ]:
             card = QFrame()
-            card.setStyleSheet(f"background:{C['card']};border:1px solid {C['border']};border-radius:6px;")
-            cv = QVBoxLayout(card); cv.setContentsMargins(8,4,8,4); cv.setSpacing(1)
-            lt = QLabel(label); lt.setStyleSheet(f"color:{C['txt3']};font-size:8px;font-weight:bold;")
+            card.setStyleSheet(
+                f"background:{C['card']};border:1px solid {C['border']};border-radius:6px;")
+            cv = QVBoxLayout(card)
+            cv.setContentsMargins(8, 4, 8, 4)
+            cv.setSpacing(1)
+            lt = QLabel(label)
+            lt.setStyleSheet(
+                f"color:{C['txt3']};font-size:8px;font-weight:bold;")
             lt.setAlignment(Qt.AlignCenter)
-            lv = QLabel("—"); lv.setStyleSheet(f"color:{color};font-size:13px;font-weight:bold;font-family:Consolas;")
+            lv = QLabel("—")
+            lv.setStyleSheet(
+                f"color:{color};font-size:13px;font-weight:bold;font-family:Consolas;")
             lv.setAlignment(Qt.AlignCenter)
-            cv.addWidget(lt); cv.addWidget(lv)
+            cv.addWidget(lt)
+            cv.addWidget(lv)
             self._rpt_cards[key] = lv
             hs.addWidget(card)
         vl.addWidget(grp_sum)
@@ -1149,10 +1805,10 @@ class GUI(QMainWindow):
         # ── Event table ────────────────────────────────────────────
         grp_tbl = QGroupBox("Position Events")
         tl = QVBoxLayout(grp_tbl)
-        self.rpt_table = QTableWidget(0, 10)
+        self.rpt_table = QTableWidget(0, 11)
         self.rpt_table.setHorizontalHeaderLabels([
-            "Time", "Symbol", "Type", "Entry", "Close",
-            "SL", "TP", "P&L $", "P&L Pips", "Close Reason"
+            "Time", "Symbol", "G/L", "Type", "Entry", "Close",
+            "SL", "TP", "P&L $", "P&L Pips", "Reason"
         ])
         self.rpt_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.rpt_table.setAlternatingRowColors(True)
@@ -1193,220 +1849,108 @@ class GUI(QMainWindow):
         return w
 
     def _refresh_report(self):
-        """Pull all closed positions + open positions from MT5 and build report."""
-        import MetaTrader5 as _mt5
+        """Fetch session data via session_report module and update the Report tab."""
+        sym = self.sym_combo.currentText().strip() or WATCH_SYMBOL
         try:
-            if not _mt5.initialize(): return
-            sym = self.sym_combo.currentText().strip()
+            self.lbl_rpt_status.setText("Refreshing…")
+            data = sr.fetch_session_events(sym, self._session_start)
+            events = data["events"]
+            wins = data["wins"]
+            losses = data["losses"]
+            rf_exits = data["rf_exits"]
+            total_pnl = data["total_pnl"]
+            open_cnt = data["open_count"]
 
-            # Get all closed deals from a wide window (last 7 days)
-            import time as _t
-            t_to   = datetime.now()
-            t_from = self._session_start
-            deals = _mt5.history_deals_get(t_from, t_to) or []
-
-            # Filter to bot magic number and entry/exit deal types
-            bot_deals = [d for d in deals
-                        if d.magic == MAGIC_NUMBER and d.entry in (0, 1)]
-
-            # Group by position_id → pair open+close
-            pos_map = {}
-            for d in bot_deals:
-                pid = d.position_id
-                if pid not in pos_map:
-                    pos_map[pid] = {"open": None, "close": None}
-                if d.entry == 0:
-                    pos_map[pid]["open"] = d
-                else:
-                    pos_map[pid]["close"] = d
-
-            # Also get currently open positions
-            open_pos = [p for p in (_mt5.positions_get(symbol=sym) or [])
-                       if p.magic == MAGIC_NUMBER]
-
-            events = []
-            total_pnl = 0.0
-            wins = losses = rf_exits = 0
-            best_pnl = float("-inf"); worst_pnl = float("inf")
-
-            for pid, pair in pos_map.items():
-                o = pair["open"]; c = pair["close"]
-                if o is None: continue
-                pnl   = c.profit if c else 0.0
-                pips  = round((c.price - o.price) / 0.0001, 1) if c else 0.0
-                if "BUY" in str(o.type): pips = -pips  # invert for sells
-                reason = "Open"
-                if c:
-                    reason = ("Risk-Free" if "RF" in (c.comment or "")
-                              else "SL" if c.price == o.sl
-                              else "TP" if c.price == o.tp
-                              else "Manual")
-                    total_pnl += pnl
-                    if pnl > 0: wins += 1
-                    else: losses += 1
-                    if "Risk-Free" in reason: rf_exits += 1
-                    best_pnl  = max(best_pnl, pnl)
-                    worst_pnl = min(worst_pnl, pnl)
-
-                events.append({
-                    "time":   datetime.fromtimestamp(o.time).strftime("%H:%M:%S"),
-                    "symbol": o.symbol,
-                    "type":   "BUY" if o.type == 0 else "SELL",
-                    "entry":  f"{o.price:.5f}",
-                    "close":  f"{c.price:.5f}" if c else "—",
-                    "sl":     f"{o.sl:.5f}" if o.sl else "—",
-                    "tp":     f"{o.tp:.5f}" if o.tp else "—",
-                    "pnl":    f"{pnl:+.2f}" if c else "—",
-                    "pips":   f"{pips:+.1f}" if c else "—",
-                    "reason": reason,
-                    "_pnl_v": pnl,
-                })
-
-            # Add still-open positions
-            for p in open_pos:
-                tick = _mt5.symbol_info_tick(p.symbol)
-                cur  = (tick.bid + tick.ask) / 2 if tick else 0
-                float_pnl = p.profit
-                events.append({
-                    "time":   datetime.fromtimestamp(p.time).strftime("%H:%M:%S"),
-                    "symbol": p.symbol,
-                    "type":   "BUY" if p.type == 0 else "SELL",
-                    "entry":  f"{p.price_open:.5f}",
-                    "close":  f"{cur:.5f} (open)",
-                    "sl":     f"{p.sl:.5f}" if p.sl else "—",
-                    "tp":     f"{p.tp:.5f}" if p.tp else "—",
-                    "pnl":    f"{float_pnl:+.2f}",
-                    "pips":   "—",
-                    "reason": "🟢 Open",
-                    "_pnl_v": float_pnl,
-                })
-
-            # Update table
+            # ── Fill table ────────────────────────────────────────
+            cols = ["time", "symbol", "gen_lvl", "type", "entry", "close",
+                    "sl", "tp", "pnl", "pips", "reason"]
             self.rpt_table.setRowCount(len(events))
             for row, ev in enumerate(events):
-                cols = ["time","symbol","type","entry","close","sl","tp","pnl","pips","reason"]
                 for col, key in enumerate(cols):
-                    it = QTableWidgetItem(ev[key])
+                    it = QTableWidgetItem(ev.get(key, ""))
                     pv = ev["_pnl_v"]
                     if key == "pnl":
-                        it.setForeground(QColor(C["green"] if pv > 0 else C["red"] if pv < 0 else C["txt2"]))
+                        clr = C["green"] if pv > 0 else C["red"] if pv < 0 else C["txt2"]
+                        it.setForeground(QColor(clr))
                     elif key == "type":
-                        it.setForeground(QColor(C["green"] if ev["type"] == "BUY" else C["red"]))
+                        it.setForeground(
+                            QColor(C["green"] if ev["type"] == "BUY" else C["red"]))
+                    elif key == "gen_lvl":
+                        it.setForeground(QColor(C["gold"]))
                     elif key == "reason":
                         clr = (C["gold"] if "Risk" in ev["reason"]
-                               else C["red"] if ev["reason"] == "SL"
-                               else C["green"] if ev["reason"] == "TP"
+                               else C["purple"] if "Reset" in ev["reason"]
+                               else C["red"] if "SL" in ev["reason"]
+                               else C["green"] if "TP" in ev["reason"]
                                else C["cyan"] if "Open" in ev["reason"]
                                else C["txt2"])
                         it.setForeground(QColor(clr))
                     self.rpt_table.setItem(row, col, it)
 
-            # Update summary cards
+            # ── Summary cards ─────────────────────────────────────
             dur = datetime.now() - self._session_start
-            h, m = divmod(int(dur.total_seconds()), 3600); m //= 60
+            h, rem = divmod(int(dur.total_seconds()), 3600)
+            m = rem // 60
             self._rpt_cards["duration"].setText(f"{h}h {m}m")
             self._rpt_cards["total_pos"].setText(str(len(events)))
             self._rpt_cards["wins"].setText(str(wins))
             self._rpt_cards["losses"].setText(str(losses))
             self._rpt_cards["rf_exits"].setText(str(rf_exits))
-            pnl_str = f"{total_pnl:+.2f}"
-            self._rpt_cards["pnl"].setText(pnl_str)
+            self._rpt_cards["pnl"].setText(f"{total_pnl:+.2f}")
             self._rpt_cards["pnl"].setStyleSheet(
-                f"color:{C['green'] if total_pnl >= 0 else C['red']};font-size:13px;font-weight:bold;font-family:Consolas;")
-            self._rpt_cards["best"].setText(f"{best_pnl:+.2f}" if best_pnl != float('-inf') else "—")
-            self._rpt_cards["worst"].setText(f"{worst_pnl:+.2f}" if worst_pnl != float('inf') else "—")
+                f"color:{C['green'] if total_pnl >= 0 else C['red']};"
+                f"font-size:13px;font-weight:bold;font-family:Consolas;")
+            self._rpt_cards["best"].setText(f"{data['best_pnl']:+.2f}")
+            self._rpt_cards["worst"].setText(f"{data['worst_pnl']:+.2f}")
 
             self._session_events = events
-            n_closed = sum(1 for e in events if e["reason"] != "🟢 Open")
+            n_closed = sum(1 for e in events if e["_closed"])
             self.lbl_rpt_status.setText(
-                f"Last refresh: {datetime.now().strftime('%H:%M:%S')} | "
-                f"{n_closed} closed, {len(open_pos)} open")
+                f"Refreshed {datetime.now().strftime('%H:%M:%S')} | "
+                f"{n_closed} closed · {open_cnt} open · "
+                f"W:{wins} L:{losses}")
 
         except Exception as ex:
             import traceback
+            traceback.print_exc()
             self.lbl_rpt_status.setText(f"Error: {ex}")
 
     def _export_report_csv(self):
-        """Export session events to CSV file."""
         from PyQt5.QtWidgets import QFileDialog
         fname, _ = QFileDialog.getSaveFileName(
             self, "Export CSV", f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
             "CSV Files (*.csv)")
-        if not fname: return
+        if not fname:
+            return
         try:
-            import csv
-            with open(fname, "w", newline="", encoding="utf-8") as f:
-                w = csv.DictWriter(f, fieldnames=[
-                    "time","symbol","type","entry","close","sl","tp","pnl","pips","reason"])
-                w.writeheader()
-                for ev in self._session_events:
-                    row = {k: ev[k] for k in ["time","symbol","type","entry","close","sl","tp","pnl","pips","reason"]}
-                    w.writerow(row)
-            self.lbl_rpt_status.setText(f"✅  CSV exported: {fname}")
+            sr.export_csv(self._session_events, fname)
+            self.lbl_rpt_status.setText(f"✅  CSV saved: {fname}")
         except Exception as ex:
-            self.lbl_rpt_status.setText(f"❌  Export failed: {ex}")
+            self.lbl_rpt_status.setText(f"❌  {ex}")
 
     def _export_report_txt(self):
-        """Export a human-readable text report."""
         from PyQt5.QtWidgets import QFileDialog
         fname, _ = QFileDialog.getSaveFileName(
             self, "Export Report", f"report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
             "Text Files (*.txt)")
-        if not fname: return
+        if not fname:
+            return
         try:
-            sym   = self.sym_combo.currentText().strip()
-            dur   = datetime.now() - self._session_start
-            h, m  = divmod(int(dur.total_seconds()), 3600); m //= 60
-            events = self._session_events
-            closed = [e for e in events if e["reason"] != "🟢 Open"]
-            opens  = [e for e in events if e["reason"] == "🟢 Open"]
-            wins   = [e for e in closed if float(e["pnl"].replace("—","0") or 0) > 0]
-            losses = [e for e in closed if float(e["pnl"].replace("—","0") or 0) <= 0]
-            total_pnl = sum(float(e["pnl"].replace("—","0") or 0) for e in closed)
-            wr = len(wins) / len(closed) * 100 if closed else 0
-
-            lines = [
-                "=" * 60,
-                f"  TRADERBOT SESSION REPORT",
-                f"  Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-                "=" * 60,
-                f"  Symbol:      {sym}",
-                f"  Session:     {self._session_start.strftime('%H:%M:%S')} → {datetime.now().strftime('%H:%M:%S')}  ({h}h {m}m)",
-                f"  Positions:   {len(events)} total ({len(closed)} closed, {len(opens)} open)",
-                f"  Win Rate:    {wr:.1f}%  ({len(wins)}W / {len(losses)}L)",
-                f"  Total P&L:   ${total_pnl:+.2f}",
-                "=" * 60,
-                "",
-                f"{'Time':<10} {'Type':<5} {'Entry':<10} {'Close':<16} {'P&L':>8} {'Reason':<14} {'SL':<10} {'TP':<10}",
-                "-" * 90,
-            ]
-            for ev in events:
-                lines.append(
-                    f"{ev['time']:<10} {ev['type']:<5} {ev['entry']:<10} "
-                    f"{ev['close']:<16} {ev['pnl']:>8} {ev['reason']:<14} "
-                    f"{ev['sl']:<10} {ev['tp']:<10}"
-                )
-            lines += [
-                "",
-                "=" * 60,
-                f"  Best position:  ${max((float(e['pnl'].replace('—','0') or 0) for e in closed), default=0):+.2f}",
-                f"  Worst position: ${min((float(e['pnl'].replace('—','0') or 0) for e in closed), default=0):+.2f}",
-                f"  Risk-Free exits: {sum(1 for e in closed if 'Risk' in e['reason'])}",
-                "=" * 60,
-            ]
-            with open(fname, "w", encoding="utf-8") as f:
-                f.write("\n".join(lines))
-            self.lbl_rpt_status.setText(f"✅  Report exported: {fname}")
+            sym = self.sym_combo.currentText().strip() or WATCH_SYMBOL
+            sr.export_txt(self._session_events,
+                          self._session_start, sym, fname)
+            self.lbl_rpt_status.setText(f"✅  Report saved: {fname}")
         except Exception as ex:
-            self.lbl_rpt_status.setText(f"❌  Export failed: {ex}")
+            self.lbl_rpt_status.setText(f"❌  {ex}")
 
     def _run_backtest(self):
         if self._bt_running:
             return  # already running
         hlines = [o for o in self._trader_objects if o.is_hline]
-        rects  = [o for o in self._trader_objects if o.is_rectangle and o.rect_valid]
+        rects = [o for o in self._trader_objects if o.is_rectangle and o.rect_valid]
         if not hlines and not rects:
-            self._on_log(f"{datetime.now().strftime('%H:%M:%S')}  ⚠️  Draw a line or rectangle on your chart first", "WARN")
+            self._on_log(
+                f"{datetime.now().strftime('%H:%M:%S')}  ⚠️  Draw a line or rectangle on your chart first", "WARN")
             return
 
         # Warn if pip step might be below broker minimum
@@ -1414,17 +1958,21 @@ class GUI(QMainWindow):
         ts = datetime.now().strftime('%H:%M:%S')
         self._on_log(f"{ts}  🔬 Running backtest on {sym_for_check}...", "BT")
         self._bt_running = True
-        self.btn_bt.setEnabled(False); self.btn_bt.setText("Loading…")
-        self.bt_progress.setVisible(True); self.bt_progress.setRange(0, 0)
+        self.btn_bt.setEnabled(False)
+        self.btn_bt.setText("Loading…")
+        self.bt_progress.setVisible(True)
+        self.bt_progress.setRange(0, 0)
         self._bt_play_timer.stop()
-        self.btn_bt_play.setChecked(False); self.btn_bt_play.setText("▶ Play")
+        self.btn_bt_play.setChecked(False)
+        self.btn_bt_play.setText("▶ Play")
 
-        bt_sym   = self.bt_symbol.currentText().strip() or self.sym_combo.currentText().strip() or WATCH_SYMBOL
-        pip      = get_pip_size(bt_sym)
+        bt_sym = self.bt_symbol.currentText().strip(
+        ) or self.sym_combo.currentText().strip() or WATCH_SYMBOL
+        pip = get_pip_size(bt_sym)
         pip_step = self._pip_step
-        tf       = self.bt_tf.currentText()
-        days     = self.bt_days.value()
-        rr       = self.bt_rr.value()
+        tf = self.bt_tf.currentText()
+        days = self.bt_days.value()
+        rr = self.bt_rr.value()
 
         use_hline = bool(hlines)
         if use_hline:
@@ -1432,19 +1980,20 @@ class GUI(QMainWindow):
             rect_top = rect_bot = None
         else:
             rect = rects[0]
-            src  = rect.price1
-            rect_top = rect.rect_top; rect_bot = rect.rect_bottom
+            src = rect.price1
+            rect_top = rect.rect_top
+            rect_bot = rect.rect_bottom
 
         # Capture all values for the thread closure
-        _sym      = bt_sym
-        _tf       = tf
-        _src      = src
-        _step     = pip_step
-        _rr       = rr
-        _days     = days
-        _hline    = use_hline
-        _rtop     = rect_top
-        _rbot     = rect_bot
+        _sym = bt_sym
+        _tf = tf
+        _src = src
+        _step = pip_step
+        _rr = rr
+        _days = days
+        _hline = use_hline
+        _rtop = rect_top
+        _rbot = rect_bot
 
         def _run():
             import traceback as _tb
@@ -1496,44 +2045,56 @@ class GUI(QMainWindow):
 
     def _update_strategy_state(self, trader):
         hlines = [o for o in trader if o.is_hline]
-        rects  = [o for o in trader if o.is_rectangle and o.rect_valid]
-        rounds = getattr(self._worker, 'spawn_rounds', 0) if self._worker else 0
-        pending_count = len(getattr(self._worker, 'pending_tracker', {})) if self._worker else 0
+        rects = [o for o in trader if o.is_rectangle and o.rect_valid]
+        rounds = getattr(self._worker, 'spawn_rounds',
+                         0) if self._worker else 0
+        pending_count = len(
+            getattr(self._worker, 'pending_tracker', {})) if self._worker else 0
 
         if hlines or rects:
             obj = hlines[0] if hlines else rects[0]
-            src = obj.price1 if obj.is_hline else round((obj.rect_top+obj.rect_bottom)/2,5)
+            src = obj.price1 if obj.is_hline else round(
+                (obj.rect_top+obj.rect_bottom)/2, 5)
             self.lbl_source_price.setText(f"{src:.5f}")
-            direction = getattr(self._worker, '_last_direction', '—') if self._worker else '—'
+            direction = getattr(self._worker, '_last_direction',
+                                '—') if self._worker else '—'
             if direction == 'BUY':
                 self.lbl_direction.setText("🟢 BUY bias")
-                self.lbl_direction.setStyleSheet(f"color:{C['green']};font-family:Consolas;font-size:11px;font-weight:bold;")
+                self.lbl_direction.setStyleSheet(
+                    f"color:{C['green']};font-family:Consolas;font-size:11px;font-weight:bold;")
             elif direction == 'SELL':
                 self.lbl_direction.setText("🔴 SELL bias")
-                self.lbl_direction.setStyleSheet(f"color:{C['red']};font-family:Consolas;font-size:11px;font-weight:bold;")
+                self.lbl_direction.setStyleSheet(
+                    f"color:{C['red']};font-family:Consolas;font-size:11px;font-weight:bold;")
             else:
                 self.lbl_direction.setText("— waiting")
-                self.lbl_direction.setStyleSheet(f"color:{C['txt3']};font-family:Consolas;font-size:11px;")
+                self.lbl_direction.setStyleSheet(
+                    f"color:{C['txt3']};font-family:Consolas;font-size:11px;")
             triggered = any(
                 v.get("triggered", False)
                 for v in (getattr(self._worker, 'source_registry', {}) or {}).values()
             ) if self._worker and hasattr(self._worker, 'source_registry') else False
             if triggered:
                 self.lbl_waiting.setText(f"✅ Active — {pending_count} pending")
-                self.lbl_waiting.setStyleSheet(f"color:{C['green']};font-family:Consolas;font-size:11px;font-weight:bold;")
+                self.lbl_waiting.setStyleSheet(
+                    f"color:{C['green']};font-family:Consolas;font-size:11px;font-weight:bold;")
             else:
                 self.lbl_waiting.setText("⏳ Waiting for touch")
-                self.lbl_waiting.setStyleSheet(f"color:{C['orange']};font-family:Consolas;font-size:11px;")
+                self.lbl_waiting.setStyleSheet(
+                    f"color:{C['orange']};font-family:Consolas;font-size:11px;")
         else:
             self.lbl_source_price.setText("—")
             self.lbl_direction.setText("—")
-            self.lbl_direction.setStyleSheet(f"color:{C['txt3']};font-family:Consolas;font-size:11px;")
+            self.lbl_direction.setStyleSheet(
+                f"color:{C['txt3']};font-family:Consolas;font-size:11px;")
             self.lbl_waiting.setText("Draw a line on chart")
-            self.lbl_waiting.setStyleSheet(f"color:{C['txt3']};font-family:Consolas;font-size:11px;")
+            self.lbl_waiting.setStyleSheet(
+                f"color:{C['txt3']};font-family:Consolas;font-size:11px;")
 
         self.lbl_rounds_info.setText(f"Rounds: {rounds}/9")
         color = C['red'] if rounds >= 7 else C['gold'] if rounds >= 4 else C['cyan']
-        self.lbl_rounds_info.setStyleSheet(f"color:{color};font-family:Consolas;font-size:11px;")
+        self.lbl_rounds_info.setStyleSheet(
+            f"color:{color};font-family:Consolas;font-size:11px;")
         self.lbl_phase.setText(f"G{rounds} | Pending: {pending_count}")
 
     def _on_status(self, msg):
@@ -1542,13 +2103,16 @@ class GUI(QMainWindow):
         self.lbl_status.setStyleSheet(f"color:{color};font-size:11px;")
 
     def _on_log(self, msg, level="INFO"):
-        if msg == "__BT_RESULT__": return
+        if msg == "__BT_RESULT__":
+            return
         if msg == "__REFRESH_ORDERS__":
             self._refresh_orders_tab()
             return
         if msg.startswith("__CANDLE__"):
-            try: self._last_candle = eval(msg[9:])
-            except: pass
+            try:
+                self._last_candle = eval(msg[9:])
+            except:
+                pass
             return
         if msg == "__CHECK_RF__":
             self._check_rf_sl(getattr(self, "_last_candle", {}))
@@ -1558,11 +2122,15 @@ class GUI(QMainWindow):
             self.lbl_ea_chart.setText(f"EA: {ea_sym}")
             active_sym = self.sym_combo.currentText().strip()
             if ea_sym != active_sym:
-                self.lbl_ea_chart.setStyleSheet(f"color:{C['orange']};font-size:10px;font-weight:bold;")
-                self.lbl_ea_chart.setToolTip(f"⚠️ EA is on {ea_sym} but you want {active_sym}. Drag ObjectExporter to {active_sym} chart.")
+                self.lbl_ea_chart.setStyleSheet(
+                    f"color:{C['orange']};font-size:10px;font-weight:bold;")
+                self.lbl_ea_chart.setToolTip(
+                    f"⚠️ EA is on {ea_sym} but you want {active_sym}. Drag ObjectExporter to {active_sym} chart.")
             else:
-                self.lbl_ea_chart.setStyleSheet(f"color:{C['green']};font-size:10px;")
-                self.lbl_ea_chart.setToolTip(f"EA is on the correct chart: {ea_sym}")
+                self.lbl_ea_chart.setStyleSheet(
+                    f"color:{C['green']};font-size:10px;")
+                self.lbl_ea_chart.setToolTip(
+                    f"EA is on the correct chart: {ea_sym}")
             return
         clr = {
             "NEW": C['green'], "WARN": C['orange'],
@@ -1575,26 +2143,30 @@ class GUI(QMainWindow):
 
     def _refresh_price(self):
         try:
-            sym  = self.sym_combo.currentText().strip() if hasattr(self,'sym_combo') else WATCH_SYMBOL
+            sym = self.sym_combo.currentText().strip() if hasattr(
+                self, 'sym_combo') else WATCH_SYMBOL
             tick = mt5.symbol_info_tick(sym)
             if tick:
                 p = (tick.bid + tick.ask) / 2
                 self.lbl_price.setText(f"Price: {p:.5f}")
-        except Exception: pass
+        except Exception:
+            pass
 
     def _populate_lvl_table(self, trader):
-        sym  = self.sym_combo.currentText().strip() if hasattr(self,'sym_combo') else WATCH_SYMBOL
-        pip  = get_pip_size(sym)
+        sym = self.sym_combo.currentText().strip() if hasattr(
+            self, 'sym_combo') else WATCH_SYMBOL
+        pip = get_pip_size(sym)
         step = self._pip_step * pip
         self.lvl_tbl.setRowCount(0)
         try:
             tick = mt5.symbol_info_tick(sym)
-            cur  = (tick.bid + tick.ask) / 2 if tick else 0
-        except: cur = 0
+            cur = (tick.bid + tick.ask) / 2 if tick else 0
+        except:
+            cur = 0
 
         hlines = [o for o in trader if o.is_hline]
-        rects  = [o for o in trader if o.is_rectangle]
-        rows   = []
+        rects = [o for o in trader if o.is_rectangle]
+        rows = []
 
         if hlines:
             src = hlines[0].price1
@@ -1606,22 +2178,27 @@ class GUI(QMainWindow):
 
         elif rects:
             rect = next((r for r in rects if r.rect_valid), None)
-            if rect is None: return
-            top = rect.rect_top; bot = rect.rect_bottom
+            if rect is None:
+                return
+            top = rect.rect_top
+            bot = rect.rect_bottom
             for i in range(3, 0, -1):
                 rows.append((f"🟠 Above {i}", top + step*i, C['orange']))
             rows.append((f"── TOP  {top:.5f}", top, C['gold']))
-            rows.append((f"── ZONE ({'%.5f' % (top - bot)})", (top+bot)/2, C['txt3']))
+            rows.append(
+                (f"── ZONE ({'%.5f' % (top - bot)})", (top+bot)/2, C['txt3']))
             rows.append((f"── BOT  {bot:.5f}", bot, C['gold']))
             for i in range(1, 4):
                 rows.append((f"🟢 Below {i}", bot - step*i, C['green']))
 
-        if not rows: return
+        if not rows:
+            return
         self.lvl_tbl.setRowCount(len(rows))
         for r, (lbl, price, clr) in enumerate(rows):
-            dist  = f"{'+' if price-cur >= 0 else ''}{price-cur:.2f}" if cur else "—"
+            dist = f"{'+' if price-cur >= 0 else ''}{price-cur:.2f}" if cur else "—"
             for c, v in enumerate([lbl, f"{price:.5f}", dist]):
-                it = QTableWidgetItem(v); it.setForeground(QColor(clr))
+                it = QTableWidgetItem(v)
+                it.setForeground(QColor(clr))
                 self.lvl_tbl.setItem(r, c, it)
 
     def _populate_ord_table(self, orders):
@@ -1629,8 +2206,9 @@ class GUI(QMainWindow):
         for r, o in enumerate(orders):
             clr = QColor(C['green'] if o["type"] == "BUY_STOP" else C['red'])
             for c, v in enumerate([f"L{o['level']}", o["type"],
-                                    f"{o['entry']:.5f}", f"{o['sl']:.5f}", f"{o['tp']:.5f}"]):
-                it = QTableWidgetItem(v); it.setForeground(clr)
+                                   f"{o['entry']:.5f}", f"{o['sl']:.5f}", f"{o['tp']:.5f}"]):
+                it = QTableWidgetItem(v)
+                it.setForeground(clr)
                 self.ord_pending.setItem(r, c, it)
 
     def _display_bt_result(self):
@@ -1643,12 +2221,15 @@ class GUI(QMainWindow):
         except Exception:
             return
         if not hasattr(self, '_bt_result') or self._bt_result is None:
-            err = getattr(self, '_run_err', None) or 'Unknown error — check log'
-            self._on_log(f"{datetime.now().strftime('%H:%M:%S')}  ❌ Backtest failed: {err}", "ERROR")
+            err = getattr(self, '_run_err',
+                          None) or 'Unknown error — check log'
+            self._on_log(
+                f"{datetime.now().strftime('%H:%M:%S')}  ❌ Backtest failed: {err}", "ERROR")
             return
         r = self._bt_result
         if r.candles_used == 0:
-            self._on_log(f"{datetime.now().strftime('%H:%M:%S')}  ❌ No candles returned — check symbol name and MT5 connection", "ERROR")
+            self._on_log(
+                f"{datetime.now().strftime('%H:%M:%S')}  ❌ No candles returned — check symbol name and MT5 connection", "ERROR")
             return
 
         # Summary cards
@@ -1675,7 +2256,8 @@ class GUI(QMainWindow):
 
         self.tabs.setCurrentIndex(2)
         ts = datetime.now().strftime('%H:%M:%S')
-        self._on_log(f"{ts}  🔬 {r.candles_used} bars | W:{len(r.wins)} L:{len(r.losses)} | {pp:+.1f} pips", "BT")
+        self._on_log(
+            f"{ts}  🔬 {r.candles_used} bars | W:{len(r.wins)} L:{len(r.losses)} | {pp:+.1f} pips", "BT")
 
     def _on_bt_slider(self, value: int):
         if 0 <= value < len(self._bt_snapshots):
@@ -1710,11 +2292,15 @@ class GUI(QMainWindow):
                 "SL":        C['red'],
                 "OPEN":      C['blue'],
             }.get(state, C['txt2'])
-            dir_clr = QColor(C['green'] if direction == "BUY_STOP" else C['red'])
-            emoji = {"PENDING":"⏳","TRIGGERED":"🔵","TP":"✅","SL":"❌","OPEN":"🔵"}.get(state,"?")
-            entry_touched = (direction == "BUY_STOP"  and bar_high >= o["entry"]) or                             (direction == "SELL_STOP" and bar_low  <= o["entry"])
+            dir_clr = QColor(C['green'] if direction ==
+                             "BUY_STOP" else C['red'])
+            emoji = {"PENDING": "⏳", "TRIGGERED": "🔵", "TP": "✅",
+                     "SL": "❌", "OPEN": "🔵"}.get(state, "?")
+            entry_touched = (direction == "BUY_STOP" and bar_high >= o["entry"]) or (
+                direction == "SELL_STOP" and bar_low <= o["entry"])
             sl_tp_str = f"SL {o['sl']:.5f} / TP {o['tp']:.5f}"
-            gen_colors = ["#F5A623","#00BCD4","#B388FF","#FF8C00","#00FF88"]
+            gen_colors = ["#F5A623", "#00BCD4",
+                          "#B388FF", "#FF8C00", "#00FF88"]
             gen_clr_str = gen_colors[min(o["generation"], len(gen_colors)-1)]
             vals = [f"G{o['generation']}", f"L{o['level']}", direction,
                     f"{o['entry']:.5f}", sl_tp_str, f"{emoji} {state}"]
@@ -1750,13 +2336,17 @@ class GUI(QMainWindow):
             self.bt_slider.setValue(nxt)
 
     def closeEvent(self, e):
-        self._stop(); e.accept()
+        self._stop()
+        e.accept()
 
 
 def main():
-    app = QApplication(sys.argv); app.setStyle("Fusion")
-    win = GUI(); win.show()
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    win = GUI()
+    win.show()
     sys.exit(app.exec_())
+
 
 if __name__ == "__main__":
     main()
