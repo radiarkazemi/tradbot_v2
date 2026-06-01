@@ -18,7 +18,7 @@ def fetch_session_events(symbol: str, session_start: datetime) -> dict:
         raise RuntimeError("MT5 not initialized")
 
     t_from = session_start
-    t_to = datetime.now()
+    t_to   = datetime.now()
 
     # All deals in the session window
     deals = mt5.history_deals_get(t_from, t_to) or []
@@ -47,7 +47,7 @@ def fetch_session_events(symbol: str, session_start: datetime) -> dict:
     events = []
     total_pnl = 0.0
     wins = losses = rf_exits = 0
-    best_pnl = float("-inf")
+    best_pnl  = float("-inf")
     worst_pnl = float("inf")
 
     for pid, pair in pos_map.items():
@@ -92,7 +92,7 @@ def fetch_session_events(symbol: str, session_start: datetime) -> dict:
                 losses += 1
             if "Risk" in reason:
                 rf_exits += 1
-            best_pnl = max(best_pnl, pnl)
+            best_pnl  = max(best_pnl, pnl)
             worst_pnl = min(worst_pnl, pnl)
 
         # Parse gen/level from comment if available
@@ -102,6 +102,21 @@ def fetch_session_events(symbol: str, session_start: datetime) -> dict:
         if m:
             gen_lvl = f"G{m.group(1)}-L{m.group(2)}"
 
+        # Get SL/TP from the open deal (entry deal) — deals don't have sl/tp,
+        # so we look them up from the position history via positions_get or
+        # use the order that created this position
+        entry_sl = getattr(o, 'sl', None) or 0.0
+        entry_tp = getattr(o, 'tp', None) or 0.0
+        # TradeDeal has no sl/tp — try to get from history orders for this position
+        if entry_sl == 0.0:
+            try:
+                orders = mt5.history_orders_get(position=pid)
+                if orders:
+                    entry_sl = orders[0].sl or 0.0
+                    entry_tp = orders[0].tp or 0.0
+            except Exception:
+                pass
+
         events.append({
             "time":    datetime.fromtimestamp(o.time).strftime("%m-%d %H:%M:%S"),
             "symbol":  o.symbol,
@@ -109,8 +124,8 @@ def fetch_session_events(symbol: str, session_start: datetime) -> dict:
             "type":    "BUY" if o.type == 0 else "SELL",
             "entry":   f"{o.price:.5f}",
             "close":   f"{c.price:.5f}" if c else "—",
-            "sl":      f"{o.sl:.5f}" if o.sl else "—",
-            "tp":      f"{o.tp:.5f}" if o.tp else "—",
+            "sl":      f"{entry_sl:.5f}" if entry_sl else "—",
+            "tp":      f"{entry_tp:.5f}" if entry_tp else "—",
             "pnl":     f"{pnl:+.2f}" if c else "—",
             "pips":    f"{pips:+.1f}" if c else "—",
             "reason":  reason,
@@ -121,7 +136,7 @@ def fetch_session_events(symbol: str, session_start: datetime) -> dict:
     # Add still-open positions
     for p in open_pos:
         tick = mt5.symbol_info_tick(p.symbol)
-        cur = (tick.bid + tick.ask) / 2 if tick else 0.0
+        cur  = (tick.bid + tick.ask) / 2 if tick else 0.0
         import re
         m = re.search(r'G(\d+)L(\d+)', p.comment or "")
         gen_lvl = f"G{m.group(1)}-L{m.group(2)}" if m else ""
@@ -150,16 +165,15 @@ def fetch_session_events(symbol: str, session_start: datetime) -> dict:
         "losses":    losses,
         "rf_exits":  rf_exits,
         "total_pnl": total_pnl,
-        "best_pnl":  best_pnl if best_pnl != float("-inf") else 0.0,
-        "worst_pnl": worst_pnl if worst_pnl != float("inf") else 0.0,
+        "best_pnl":  best_pnl  if best_pnl  != float("-inf") else 0.0,
+        "worst_pnl": worst_pnl if worst_pnl != float("inf")  else 0.0,
         "open_count": len(open_pos),
     }
 
 
 def export_csv(events: list, filepath: str):
     """Write events list to a CSV file."""
-    cols = ["time", "symbol", "gen_lvl", "type", "entry",
-            "close", "sl", "tp", "pnl", "pips", "reason"]
+    cols = ["time","symbol","gen_lvl","type","entry","close","sl","tp","pnl","pips","reason"]
     with open(filepath, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
         w.writeheader()
@@ -169,8 +183,8 @@ def export_csv(events: list, filepath: str):
 def export_txt(events: list, session_start: datetime, symbol: str, filepath: str):
     """Write a human-readable text report."""
     closed = [e for e in events if e["_closed"]]
-    opens = [e for e in events if not e["_closed"]]
-    wins = [e for e in closed if e["_pnl_v"] > 0]
+    opens  = [e for e in events if not e["_closed"]]
+    wins   = [e for e in closed if e["_pnl_v"] > 0]
     losses = [e for e in closed if e["_pnl_v"] <= 0]
     total_pnl = sum(e["_pnl_v"] for e in closed)
     wr = len(wins) / len(closed) * 100 if closed else 0
