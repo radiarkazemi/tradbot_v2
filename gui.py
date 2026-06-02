@@ -331,14 +331,14 @@ class GUI(QMainWindow):
         sv.setColumnStretch(1, 1)
         vl.addWidget(grp_strat)
 
-        # ── Peak P&L Dashboard ────────────────────────────────────
-        grp_peak = QGroupBox("📈  Peak P&L Tracker")
+        # ── Peak P&L Dashboard + Auto-Close ──────────────────────
+        grp_peak = QGroupBox("📈  Peak P&L Tracker & Auto-Close")
         grp_peak.setStyleSheet(
             f"QGroupBox {{ background:{C['card']};border:1px solid {C['border_hi']};"
             f"border-radius:6px;margin-top:14px;padding:8px 6px 6px 6px;"
             f"font-size:10px;font-weight:bold;color:{C['gold']}; }}"
             f"QGroupBox::title {{ subcontrol-origin:margin;left:10px;padding:0 4px; }}")
-        pv = QVBoxLayout(grp_peak); pv.setSpacing(4); pv.setContentsMargins(8,6,8,6)
+        pv = QVBoxLayout(grp_peak); pv.setSpacing(5); pv.setContentsMargins(8,6,8,6)
 
         # Big P&L numbers row
         pnl_row = QHBoxLayout(); pnl_row.setSpacing(6)
@@ -360,31 +360,152 @@ class GUI(QMainWindow):
             return f
 
         self._peak_cards = {}
-        pnl_row.addWidget(_big_card("current",  "NOW",    C['cyan']))
-        pnl_row.addWidget(_big_card("peak",     "PEAK",   C['green']))
+        pnl_row.addWidget(_big_card("current",  "NOW",       C['cyan']))
+        pnl_row.addWidget(_big_card("peak",     "PEAK",      C['green']))
         pnl_row.addWidget(_big_card("drawdown", "FROM PEAK", C['red']))
         pv.addLayout(pnl_row)
 
-        # Alert threshold row
+        # Velocity card — shows P&L speed
+        vel_row = QHBoxLayout(); vel_row.setSpacing(6)
+        pnl_row.addWidget(_big_card("velocity", "$/MIN",     C['gold']))
+        pv.addLayout(vel_row)
+
+        # ── Auto-close rules (separator) ─────────────────────────
+        sep = QFrame(); sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet(f"color:{C['border_hi']};")
+        pv.addWidget(sep)
+
+        ac_title = QLabel("⚡ Auto-Close Rules")
+        ac_title.setStyleSheet(
+            f"color:{C['gold']};font-size:10px;font-weight:bold;letter-spacing:1px;")
+        pv.addWidget(ac_title)
+
+        def _ac_row(label, spin_min, spin_max, spin_default, suffix, tip, chk_default=False):
+            row = QHBoxLayout(); row.setSpacing(6)
+            chk = QCheckBox()
+            chk.setChecked(chk_default)
+            chk.setStyleSheet(f"color:{C['txt2']};")
+            lbl = QLabel(label)
+            lbl.setStyleSheet(f"color:{C['txt2']};font-size:10px;")
+            lbl.setWordWrap(True)
+            lbl.setToolTip(tip)
+            spin = QDoubleSpinBox()
+            spin.setRange(spin_min, spin_max)
+            spin.setValue(spin_default)
+            spin.setDecimals(1)
+            spin.setSuffix(suffix)
+            spin.setMinimumWidth(75)
+            spin.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            spin.setToolTip(tip)
+            spin.setEnabled(chk_default)
+            chk.toggled.connect(spin.setEnabled)
+            row.addWidget(chk)
+            row.addWidget(lbl)
+            row.addWidget(spin)
+            pv.addLayout(row)
+            return chk, spin
+
+        # Rule 1: Minimum profit target (blocks ALL auto-close below this)
+        r1_row = QHBoxLayout(); r1_row.setSpacing(6)
+        self.chk_min_profit = QCheckBox()
+        self.chk_min_profit.setChecked(True)
+        self.chk_min_profit.setStyleSheet(f"color:{C['txt2']};")
+        lbl_mp = QLabel("Min profit to close:")
+        lbl_mp.setStyleSheet(f"color:{C['txt2']};font-size:10px;")
+        lbl_mp.setToolTip(
+            "Auto-close will NEVER fire unless total P&L is above this.\n"
+            "Click '⟳ Calc' to auto-calculate based on your symbol + lot size.\n"
+            "Formula: lot × pip_value × 50 pips (approx 1 good cascade)")
+        self.spin_min_profit = QDoubleSpinBox()
+        self.spin_min_profit.setRange(0, 10000)
+        self.spin_min_profit.setValue(70.0)
+        self.spin_min_profit.setDecimals(1)
+        self.spin_min_profit.setSuffix(" $")
+        self.spin_min_profit.setMinimumWidth(70)
+        self.spin_min_profit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.spin_min_profit.setEnabled(True)
+        self.chk_min_profit.toggled.connect(self.spin_min_profit.setEnabled)
+        btn_calc = QPushButton("⟳")
+        btn_calc.setFixedSize(24, 24)
+        btn_calc.setToolTip("Auto-calculate min profit for current symbol + lot size")
+        btn_calc.setStyleSheet(
+            f"background:{C['border']};color:{C['gold']};border:1px solid {C['gold']};"
+            f"border-radius:3px;font-size:11px;font-weight:bold;padding:0;")
+        btn_calc.clicked.connect(self._calc_min_profit)
+        r1_row.addWidget(self.chk_min_profit)
+        r1_row.addWidget(lbl_mp)
+        r1_row.addWidget(self.spin_min_profit)
+        r1_row.addWidget(btn_calc)
+        pv.addLayout(r1_row)
+
+        # Rule 2: Velocity close (blowoff top detection)
+        self.chk_velocity, self.spin_velocity = _ac_row(
+            "Velocity close ($/min):",
+            1, 1000, 20.0, " $/m",
+            "Close when P&L gains this much in 60 seconds.\n"
+            "Catches the blowoff top — a fast spike followed by reversal.\n"
+            "Example: 20 = close when you gain $20 in under 60 seconds.\n"
+            "Has a 30s countdown you can cancel.",
+            True)
+
+        # Rule 3: Drawdown close (reversal protection)
+        self.chk_drawdown, self.spin_drawdown = _ac_row(
+            "Drawdown close ($):",
+            1, 1000, 25.0, " $",
+            "Close when P&L drops this much from its session peak.\n"
+            "Protects from holding through a full reversal.\n"
+            "Example: 25 = if peak was $110, close if P&L falls to $85.\n"
+            "Only fires if you're still above the minimum profit target.",
+            True)
+
+        # Rule 4: Rounds complete close
+        self.chk_rounds_close, self.spin_rounds_wait = _ac_row(
+            "Close after round 9/9 +",
+            1, 60, 10.0, " min",
+            "After all 9 rounds complete, start a countdown.\n"
+            "If no new high is made within this time, close everything.\n"
+            "Prevents holding dead positions after the cascade exhausts.",
+            True)
+
+        # Alert-only threshold (existing feature, kept)
         alert_row = QHBoxLayout(); alert_row.setSpacing(6)
-        lbl_al = QLabel("🔔 Alert at:")
-        lbl_al.setStyleSheet(f"color:{C['txt2']};font-size:11px;")
+        lbl_al = QLabel("🔔 Alert only at:")
+        lbl_al.setStyleSheet(f"color:{C['txt2']};font-size:10px;")
         alert_row.addWidget(lbl_al)
         self.spin_alert = QDoubleSpinBox()
         self.spin_alert.setRange(1, 10000); self.spin_alert.setValue(50)
         self.spin_alert.setDecimals(1); self.spin_alert.setSuffix(" $")
-        self.spin_alert.setMinimumWidth(80)
+        self.spin_alert.setMinimumWidth(75)
         self.spin_alert.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self.spin_alert.setToolTip(
-            "Flash and sound alert when total P&L crosses this value.\n"
-            "Does NOT auto-close — you decide when to exit.")
+        self.spin_alert.setToolTip("Sound + flash alert only. Does NOT auto-close.")
         alert_row.addWidget(self.spin_alert)
-        self.chk_alert = QCheckBox("enabled")
+        self.chk_alert = QCheckBox("on")
         self.chk_alert.setChecked(True)
         self.chk_alert.setStyleSheet(f"color:{C['txt2']};font-size:10px;")
         alert_row.addWidget(self.chk_alert)
         alert_row.addStretch()
         pv.addLayout(alert_row)
+
+        # Countdown banner (hidden until auto-close fires)
+        self.lbl_autoclose_banner = QLabel("")
+        self.lbl_autoclose_banner.setStyleSheet(
+            f"color:{C['red']};font-size:12px;font-weight:bold;"
+            f"background:{C['red_dk']};border:1px solid {C['red']};"
+            f"border-radius:4px;padding:4px;")
+        self.lbl_autoclose_banner.setAlignment(Qt.AlignCenter)
+        self.lbl_autoclose_banner.setWordWrap(True)
+        self.lbl_autoclose_banner.hide()
+        pv.addWidget(self.lbl_autoclose_banner)
+
+        # Cancel auto-close countdown button
+        self.btn_cancel_autoclose = QPushButton("✋  Cancel Auto-Close")
+        self.btn_cancel_autoclose.setStyleSheet(
+            f"QPushButton {{ background:{C['orange']};color:#000;"
+            f"font-weight:bold;border-radius:4px;font-size:11px; }}"
+            f"QPushButton:hover {{ background:#FFB300; }}")
+        self.btn_cancel_autoclose.hide()
+        self.btn_cancel_autoclose.clicked.connect(self._cancel_autoclose)
+        pv.addWidget(self.btn_cancel_autoclose)
 
         # Status line
         self.lbl_peak_status = QLabel("Start watcher to begin tracking")
@@ -393,7 +514,7 @@ class GUI(QMainWindow):
         self.lbl_peak_status.setWordWrap(True)
         pv.addWidget(self.lbl_peak_status)
 
-        # Close All & Reset button — big, prominent
+        # Close All & Reset button
         self.btn_close_reset = QPushButton("🏁  Close All Positions & Reset")
         self.btn_close_reset.setMinimumHeight(38)
         self.btn_close_reset.setStyleSheet(
@@ -404,16 +525,21 @@ class GUI(QMainWindow):
             f"QPushButton:pressed {{ background:#0A0015; }}")
         self.btn_close_reset.setToolTip(
             "Close ALL open positions + cancel ALL pending orders\n"
-            "then reset the bot state (rounds, source lines, peak tracker).\n"
-            "Use this when you see the peak and want a clean restart.")
+            "then reset the bot state. Use at the peak.")
         self.btn_close_reset.clicked.connect(self._close_all_and_reset)
         pv.addWidget(self.btn_close_reset)
 
         vl.addWidget(grp_peak)
 
         # Internal peak tracking state
-        self._session_peak_pnl    = 0.0
+        self._session_peak_pnl     = 0.0
         self._session_peak_alerted = False
+        self._alert_was_above      = False
+        self._pnl_history          = []   # [(timestamp, pnl), ...] rolling 90s window
+        self._autoclose_countdown  = 0    # seconds remaining in countdown
+        self._autoclose_reason     = ""
+        self._rounds9_time         = None  # when spawn_rounds first hit 9
+        self._rounds9_peak_at_9    = 0.0
         self._peak_timer = QTimer()
         self._peak_timer.timeout.connect(self._refresh_peak_pnl)
         self._peak_timer.start(1000)  # update every second
@@ -1378,38 +1504,64 @@ class GUI(QMainWindow):
         write_commands(["DELETE|TB_RF_SL"], symbol=sym)
 
     def _refresh_peak_pnl(self):
-        """Update the peak P&L dashboard every second."""
+        """Update the peak P&L dashboard every second and evaluate auto-close rules."""
         try:
             import MetaTrader5 as _mt5
-            sym = self.sym_combo.currentText().strip() or WATCH_SYMBOL
+            import time as _time
+            sym     = self.sym_combo.currentText().strip() or WATCH_SYMBOL
             positions = _mt5.positions_get(symbol=sym) or []
             bot_pos   = [p for p in positions if p.magic == MAGIC_NUMBER]
-
+            n_pos     = len(bot_pos)
             current_pnl = sum(p.profit for p in bot_pos)
+            now         = _time.time()
+            rounds      = getattr(self._worker, 'spawn_rounds', 0) if self._worker else 0
 
-            # Update peak
+            # ── Update peak ──────────────────────────────────────
             if current_pnl > self._session_peak_pnl:
-                self._session_peak_pnl     = current_pnl
-                self._session_peak_alerted = False  # reset alert for new peak
+                self._session_peak_pnl = current_pnl
+                self._alert_was_above  = False
+                if self._autoclose_countdown > 0:
+                    # New high while counting down — cancel countdown
+                    self._autoclose_countdown = 0
+                    self._autoclose_reason    = ""
+                    self.lbl_autoclose_banner.hide()
+                    self.btn_cancel_autoclose.hide()
 
-            drawdown = self._session_peak_pnl - current_pnl
+            drawdown     = self._session_peak_pnl - current_pnl
             drawdown_pct = (drawdown / self._session_peak_pnl * 100
                             if self._session_peak_pnl > 0 else 0)
 
-            # Color current P&L
+            # ── P&L history for velocity calc ────────────────────
+            self._pnl_history.append((now, current_pnl))
+            # Keep only last 90 seconds
+            self._pnl_history = [(t, v) for t, v in self._pnl_history if now - t <= 90]
+
+            # Velocity: gain over last 60 seconds
+            velocity_60s = 0.0
+            hist_60 = [(t, v) for t, v in self._pnl_history if now - t <= 60]
+            if len(hist_60) >= 2:
+                velocity_60s = hist_60[-1][1] - hist_60[0][1]
+
+            # ── Track rounds 9/9 completion time ─────────────────
+            if rounds >= 9 and self._rounds9_time is None:
+                self._rounds9_time     = now
+                self._rounds9_peak_at_9 = current_pnl
+                self._on_log(
+                    f"{datetime.now().strftime('%H:%M:%S')}  ⚠️  ALL 9 ROUNDS COMPLETE — "
+                    f"cascade exhausted | watching for reversal", "WARN")
+
+            # ── Update display cards ──────────────────────────────
             cur_color = C['green'] if current_pnl >= 0 else C['red']
             self._peak_cards["current"].setText(f"{current_pnl:+.2f}")
             self._peak_cards["current"].setStyleSheet(
                 f"color:{cur_color};font-size:17px;font-weight:bold;font-family:Consolas;")
 
-            # Peak
-            peak_color = C['green'] if self._session_peak_pnl > 0 else C['txt3']
             self._peak_cards["peak"].setText(f"{self._session_peak_pnl:+.2f}")
             self._peak_cards["peak"].setStyleSheet(
-                f"color:{peak_color};font-size:17px;font-weight:bold;font-family:Consolas;")
+                f"color:{C['green'] if self._session_peak_pnl > 0 else C['txt3']};"
+                f"font-size:17px;font-weight:bold;font-family:Consolas;")
 
-            # Drawdown from peak
-            if drawdown > 0:
+            if drawdown > 0.01:
                 dd_color = C['red'] if drawdown_pct > 20 else C['orange']
                 self._peak_cards["drawdown"].setText(f"-{drawdown:.2f} ({drawdown_pct:.0f}%)")
                 self._peak_cards["drawdown"].setStyleSheet(
@@ -1419,39 +1571,238 @@ class GUI(QMainWindow):
                 self._peak_cards["drawdown"].setStyleSheet(
                     f"color:{C['txt3']};font-size:17px;font-weight:bold;font-family:Consolas;")
 
-            # Status line
-            n_pos = len(bot_pos)
-            rounds = getattr(self._worker, 'spawn_rounds', 0) if self._worker else 0
-            self.lbl_peak_status.setText(
-                f"{n_pos} positions open | Rounds: {rounds}/9 | "
-                f"Best: {self._session_peak_pnl:+.2f}")
+            vel_color = C['green'] if velocity_60s > 0 else C['red'] if velocity_60s < -2 else C['txt3']
+            self._peak_cards["velocity"].setText(f"{velocity_60s:+.2f}")
+            self._peak_cards["velocity"].setStyleSheet(
+                f"color:{vel_color};font-size:17px;font-weight:bold;font-family:Consolas;")
 
-            # Alert check — fires ONCE when crossing threshold, resets when P&L drops below
-            alert_threshold = self.spin_alert.value()
-            was_above = getattr(self, "_alert_was_above", False)
+            self.lbl_peak_status.setText(
+                f"{n_pos} open | Rounds: {rounds}/9 | "
+                f"Peak: {self._session_peak_pnl:+.2f} | "
+                f"{'⚠️ POST-9/9' if rounds >= 9 else 'running'}")
+
+            # ── Alert-only check ──────────────────────────────────
             if self.chk_alert.isChecked() and n_pos > 0:
-                if current_pnl >= alert_threshold and not was_above:
+                if current_pnl >= self.spin_alert.value() and not self._alert_was_above:
                     self._alert_was_above = True
                     self._fire_pnl_alert(current_pnl)
-                elif current_pnl < alert_threshold * 0.9:  # 10% buffer before resetting
+                elif current_pnl < self.spin_alert.value() * 0.9:
                     self._alert_was_above = False
 
-            # Flash background red if drawdown > 30% of peak (visual warning)
-            if drawdown_pct > 30 and self._session_peak_pnl > 5:
-                self.btn_close_reset.setStyleSheet(
-                    f"QPushButton {{ background:{C['red_dk']};color:{C['red']};"
-                    f"border:2px solid {C['red']};border-radius:5px;"
-                    f"font-weight:bold;font-size:13px; }}"
-                    f"QPushButton:hover {{ background:{C['red']};color:#fff; }}")
-            else:
-                self.btn_close_reset.setStyleSheet(
-                    f"QPushButton {{ background:#1A0A2A;color:{C['purple']};"
-                    f"border:2px solid {C['purple']};border-radius:5px;"
-                    f"font-weight:bold;font-size:13px; }}"
-                    f"QPushButton:hover {{ background:{C['purple']};color:#fff; }}")
+            # ── Countdown tick ────────────────────────────────────
+            if self._autoclose_countdown > 0:
+                self._autoclose_countdown -= 1
+                self.lbl_autoclose_banner.setText(
+                    f"⚡ AUTO-CLOSE in {self._autoclose_countdown}s\n"
+                    f"Reason: {self._autoclose_reason}\n"
+                    f"P&L now: ${current_pnl:+.2f} | Peak: ${self._session_peak_pnl:+.2f}")
+                if self._autoclose_countdown <= 0:
+                    self.lbl_autoclose_banner.hide()
+                    self.btn_cancel_autoclose.hide()
+                    self._execute_autoclose(f"Auto-close: {self._autoclose_reason}")
+                return  # don't re-evaluate rules while counting down
+
+            # ── Auto-close rule evaluation ────────────────────────
+            # Gate: only evaluate if there are open positions and countdown not active
+            if n_pos == 0 or self._autoclose_countdown > 0:
+                self._update_close_button_style(drawdown_pct)
+                return
+
+            min_profit = self.spin_min_profit.value() if self.chk_min_profit.isChecked() else 0.0
+
+            # Rule 1 — Velocity close (blowoff top)
+            if (self.chk_velocity.isChecked() and
+                    velocity_60s >= self.spin_velocity.value() and
+                    current_pnl >= min_profit):
+                self._arm_autoclose(
+                    f"VELOCITY: +${velocity_60s:.2f} in 60s (blowoff top)",
+                    countdown=30)
+                return
+
+            # Rule 2 — Drawdown close (reversal)
+            if (self.chk_drawdown.isChecked() and
+                    drawdown >= self.spin_drawdown.value() and
+                    current_pnl >= min_profit):
+                self._arm_autoclose(
+                    f"DRAWDOWN: -${drawdown:.2f} from peak ${self._session_peak_pnl:.2f}",
+                    countdown=15)
+                return
+
+            # Rule 3 — Rounds 9/9 timeout
+            if (self.chk_rounds_close.isChecked() and
+                    rounds >= 9 and self._rounds9_time is not None and
+                    current_pnl >= min_profit):
+                mins_since_9 = (now - self._rounds9_time) / 60.0
+                wait_mins    = self.spin_rounds_wait.value()
+                # Only close if peak hasn't improved since round 9 completed
+                if (mins_since_9 >= wait_mins and
+                        current_pnl <= self._rounds9_peak_at_9):
+                    self._arm_autoclose(
+                        f"ROUNDS 9/9 DONE: no new high in {mins_since_9:.0f}min",
+                        countdown=20)
+                    return
+
+            self._update_close_button_style(drawdown_pct)
 
         except Exception:
             pass
+
+    def _arm_autoclose(self, reason: str, countdown: int):
+        """Start the auto-close countdown."""
+        import winsound
+        self._autoclose_countdown = countdown
+        self._autoclose_reason    = reason
+        ts = datetime.now().strftime('%H:%M:%S')
+        self._on_log(
+            f"{ts}  ⚡  AUTO-CLOSE ARMED — {reason} | "
+            f"closing in {countdown}s (click ✋ to cancel)", "NEW")
+        self.lbl_autoclose_banner.show()
+        self.btn_cancel_autoclose.show()
+        try: winsound.MessageBeep(winsound.MB_ICONHAND)
+        except Exception: pass
+
+    def _calc_min_profit(self):
+        """
+        Auto-calculate the minimum profit threshold for the current symbol + lot size.
+
+        Logic:
+        - Get symbol's tick value (profit per 1 pip move for 1 lot)
+        - Multiply by lot size
+        - Multiply by 50 pips (a full cascade L1+L2+L3 run covers ~45 pips total)
+        - That's what ONE good round is worth — use as the floor
+
+        EURUSD 0.05 lot: $0.50/pip × 0.05 × 50 = $1.25... wait, that's per position.
+        For the full cascade (9 rounds × 3 positions avg) = ~15 positions at 0.05 lot:
+        15 × $0.50/pip × 0.05 lot × 10 pips avg gain = $37.50
+        So minimum = lot × pip_value_per_lot × 150 pips equivalent
+        """
+        import MetaTrader5 as _mt5
+        try:
+            sym  = self.sym_combo.currentText().strip() or WATCH_SYMBOL
+            lot  = self.spin_lot.value() if hasattr(self, 'spin_lot') else 0.05
+            info = _mt5.symbol_info(sym)
+            if not info:
+                self._on_log(
+                    f"{datetime.now().strftime('%H:%M:%S')}  ⚠️  Symbol info not available", "WARN")
+                return
+
+            # tick_value = profit in account currency per 1 tick (smallest move) for 1 lot
+            tick_val  = info.trade_tick_value   # e.g. EURUSD = $1 per 0.00001 per lot
+            tick_size = info.trade_tick_size    # e.g. 0.00001
+            point     = info.point
+
+            # pip_value_per_lot = profit per 1 pip per 1 lot
+            # For EURUSD: $10/pip/lot. For XAUUSD: ~$10/pip/lot at standard
+            pip_size = point * 10 if 'JPY' not in sym.upper() else point * 100
+            pip_value_per_lot = (tick_val / tick_size) * pip_size
+
+            # Per lot at user's lot size
+            pip_value = pip_value_per_lot * lot
+
+            # Min profit = value of a full successful cascade
+            # Assume 6 positions avg profit of 30 pips each (conservative)
+            min_profit = round(pip_value * 6 * 30, 1)
+
+            # Clamp: never below $10, never above $500
+            min_profit = max(10.0, min(500.0, min_profit))
+
+            self.spin_min_profit.setValue(min_profit)
+            self._on_log(
+                f"{datetime.now().strftime('%H:%M:%S')}  ⟳  Min profit calculated: "
+                f"${min_profit:.1f} | "
+                f"({sym} | lot={lot} | pip_val=${pip_value:.3f}/pip)", "INFO")
+
+        except Exception as e:
+            self._on_log(
+                f"{datetime.now().strftime('%H:%M:%S')}  ⚠️  Calc failed: {e}", "WARN")
+
+    def _cancel_autoclose(self):
+        """Cancel the auto-close countdown."""
+        self._autoclose_countdown = 0
+        self._autoclose_reason    = ""
+        self.lbl_autoclose_banner.hide()
+        self.btn_cancel_autoclose.hide()
+        self._on_log(
+            f"{datetime.now().strftime('%H:%M:%S')}  ✋  Auto-close CANCELLED by user", "WARN")
+
+    def _execute_autoclose(self, reason: str):
+        """Execute auto-close — same as Close All & Reset but automatic."""
+        import MetaTrader5 as _mt5
+        sym = self.sym_combo.currentText().strip() or WATCH_SYMBOL
+        positions = _mt5.positions_get(symbol=sym) or []
+        bot_pos   = [p for p in positions if p.magic == MAGIC_NUMBER]
+        pending   = _mt5.orders_get(symbol=sym) or []
+        bot_pend  = [o for o in pending if o.magic == MAGIC_NUMBER]
+        total_pnl = sum(p.profit for p in bot_pos)
+
+        closed = cancelled = 0
+        for p in bot_pos:
+            close_type = _mt5.ORDER_TYPE_SELL if p.type == 0 else _mt5.ORDER_TYPE_BUY
+            tick = _mt5.symbol_info_tick(sym)
+            price = tick.bid if close_type == _mt5.ORDER_TYPE_SELL else tick.ask
+            for filling in (_mt5.ORDER_FILLING_FOK, _mt5.ORDER_FILLING_IOC,
+                            _mt5.ORDER_FILLING_RETURN):
+                req = {
+                    "action": _mt5.TRADE_ACTION_DEAL, "symbol": sym,
+                    "volume": p.volume, "type": close_type, "position": p.ticket,
+                    "price": price, "deviation": 50, "magic": MAGIC_NUMBER,
+                    "comment": "TB_AUTOCLOSE", "type_time": _mt5.ORDER_TIME_GTC,
+                    "type_filling": filling,
+                }
+                res = _mt5.order_send(req)
+                if res and res.retcode == _mt5.TRADE_RETCODE_DONE:
+                    closed += 1; break
+
+        for o in bot_pend:
+            res = _mt5.order_send({"action": _mt5.TRADE_ACTION_REMOVE, "order": o.ticket})
+            if res and res.retcode == _mt5.TRADE_RETCODE_DONE:
+                cancelled += 1
+
+        write_commands(["DELETE_PREFIX|TB_"], symbol=sym)
+
+        # Reset watcher state
+        if self._worker:
+            self._worker.spawn_rounds    = 0
+            self._worker.spawned_keys    = set()
+            self._worker.pending_tracker = {}
+            self._worker.drawn           = {}
+            self._worker.prev_names      = set()
+            self._worker.orders_placed   = set()
+            self._worker.source_registry = {}
+            self._worker._source_registry = {}
+
+        last_peak = self._session_peak_pnl
+        self._session_peak_pnl  = 0.0
+        self._alert_was_above   = False
+        self._pnl_history       = []
+        self._rounds9_time      = None
+        self._rounds9_peak_at_9 = 0.0
+        for key in self._peak_cards:
+            self._peak_cards[key].setText("—")
+        self.lbl_peak_status.setText("Reset — draw new line to start")
+        self.lbl_autoclose_banner.hide()
+        self.btn_cancel_autoclose.hide()
+
+        ts = datetime.now().strftime('%H:%M:%S')
+        self._on_log(
+            f"{ts}  ⚡  AUTO-CLOSE EXECUTED | {reason} | "
+            f"closed {closed} positions | locked ~${total_pnl:+.2f} | "
+            f"session peak was ${last_peak:+.2f}", "NEW")
+
+    def _update_close_button_style(self, drawdown_pct: float):
+        """Update the close button color based on drawdown severity."""
+        if drawdown_pct > 30 and self._session_peak_pnl > 5:
+            self.btn_close_reset.setStyleSheet(
+                f"QPushButton {{ background:{C['red_dk']};color:{C['red']};"
+                f"border:2px solid {C['red']};border-radius:5px;"
+                f"font-weight:bold;font-size:13px; }}"
+                f"QPushButton:hover {{ background:{C['red']};color:#fff; }}")
+        else:
+            self.btn_close_reset.setStyleSheet(
+                f"QPushButton {{ background:#1A0A2A;color:{C['purple']};"
+                f"border:2px solid {C['purple']};border-radius:5px;"
+                f"font-weight:bold;font-size:13px; }}"
+                f"QPushButton:hover {{ background:{C['purple']};color:#fff; }}")
 
     def _fire_pnl_alert(self, pnl: float):
         """Flash GUI and play sound when P&L target is reached."""
