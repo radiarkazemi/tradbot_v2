@@ -1592,6 +1592,33 @@ class GUI(QMainWindow):
             # ── Countdown tick ────────────────────────────────────
             if self._autoclose_countdown > 0:
                 self._autoclose_countdown -= 1
+
+                # Extension logic: if a new candle just closed stronger in the
+                # trend direction (P&L still rising), add 10s to the countdown
+                candle_t = None
+                if self._worker:
+                    try:
+                        import MetaTrader5 as _mt5c
+                        bars = _mt5c.copy_rates_from_pos(sym, 1, 0, 2)  # M1 last 2 bars
+                        if bars is not None and len(bars) >= 2:
+                            latest_close_t = int(bars[-1]['time'])
+                            last_seen_t    = getattr(self, '_last_countdown_candle_t', 0)
+                            if latest_close_t > last_seen_t:
+                                self._last_countdown_candle_t = latest_close_t
+                                # New candle closed — measure P&L change since countdown started
+                                pnl_at_arm = getattr(self, '_countdown_pnl_at_arm', current_pnl)
+                                gain_since_arm = current_pnl - pnl_at_arm
+                                if gain_since_arm > 2.0:
+                                    # Still gaining — extend countdown by 10 seconds
+                                    extension = 10
+                                    self._autoclose_countdown += extension
+                                    self._on_log(
+                                        f"{datetime.now().strftime('%H:%M:%S')}  ⏳  Countdown extended "
+                                        f"+{extension}s — trend still accelerating "
+                                        f"(+${gain_since_arm:.2f} since arm)", "INFO")
+                    except Exception:
+                        pass
+
                 self.lbl_autoclose_banner.setText(
                     f"⚡ AUTO-CLOSE in {self._autoclose_countdown}s\n"
                     f"Reason: {self._autoclose_reason}\n"
@@ -1650,8 +1677,14 @@ class GUI(QMainWindow):
     def _arm_autoclose(self, reason: str, countdown: int):
         """Start the auto-close countdown."""
         import winsound
-        self._autoclose_countdown = countdown
-        self._autoclose_reason    = reason
+        self._autoclose_countdown        = countdown
+        self._autoclose_reason           = reason
+        self._last_countdown_candle_t    = 0
+        self._countdown_pnl_at_arm       = sum(
+            p.profit for p in ([] if not self._worker else
+            (__import__('MetaTrader5').positions_get(
+                symbol=self.sym_combo.currentText().strip()) or []))
+            if p.magic == MAGIC_NUMBER)
         ts = datetime.now().strftime('%H:%M:%S')
         self._on_log(
             f"{ts}  ⚡  AUTO-CLOSE ARMED — {reason} | "
