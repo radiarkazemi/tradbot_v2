@@ -176,6 +176,25 @@ class WatcherWorker(threading.Thread):
             if self.spawn_rounds >= 9:
                 self.log("⛔  Max 9 rounds reached — no more spawning"); break
 
+            # WWW/MMM pattern: G0 → G1 is the max depth.
+            # When G1 L3 hits, don't spawn G2 — instead arm pullback on the
+            # original main source so price returns to origin for the next W/M leg.
+            if gen >= 1:
+                self.log(
+                    f"↩️  G{gen}-L{level} {direction} hit @ {entry:.5f} — "
+                    f"max depth reached | pullback to main line armed for next leg", "NEW")
+                # Re-arm pullback on the original source (gen 0 source)
+                for reg in self.source_registry.values():
+                    if not reg.get("triggered"):
+                        continue
+                    reg["l3_activated"]          = True
+                    reg["l3_activated_candle_t"] = self._last_prev_t
+                    reg["_last_candle_counted"]  = self._last_prev_t
+                    reg["candles_since_l3"]      = 0
+                    reg["price_was_away"]        = False
+                    self.log(f"   ✅ Pullback re-armed on main source @ {reg['src']:.5f}")
+                break
+
             spawn_key = f"{entry:.5f}_G{gen+1}_{direction[:4]}"
             if spawn_key in self.spawned_keys:
                 self.log(f"ℹ️  Already spawned from {entry:.5f} {direction[:4]} — skipping")
@@ -270,6 +289,16 @@ class WatcherWorker(threading.Thread):
                     self.log(f"🗑️  Cancelled {cancelled} G0 pending orders before pullback")
 
                 self.log(f"🔁  Pullback [{n[:20]}] @ {src:.5f} {side} | placing fresh G0 round", "NEW")
+
+                # Reset G1 spawn keys so the next G0-L3 can spawn G1 again
+                # Keep the spawn_rounds counter running (counts total W/M legs)
+                # Remove only G1-level spawn keys — G0→G1 spawns must be allowed again
+                keys_to_remove = {k for k in self.spawned_keys if "_G1_" in k}
+                self.spawned_keys -= keys_to_remove
+                if keys_to_remove:
+                    self.log(f"   ♻️  Reset {len(keys_to_remove)} G1 spawn key(s) — "
+                             f"next G0-L3 will spawn G1 again")
+
                 self._place_orders_for_source(src, pip, generation=0)
 
     # ── Main loop ─────────────────────────────────────────────────
