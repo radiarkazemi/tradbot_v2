@@ -171,6 +171,55 @@ void ExecuteCommands()
          ObjectSetInteger(0, nm, OBJPROP_BACK,       true);
          anyDone = true;
         }
+      // DRAW_RECT|name|time1|price1|time2|price2|color|fill_color|width|style|back
+      else if(cmd == "DRAW_RECT" && n >= 7)
+        {
+         string   nm    = parts[1];
+         datetime t1    = (datetime)StringToInteger(parts[2]);
+         double   p1    = StringToDouble(parts[3]);
+         datetime t2    = (datetime)StringToInteger(parts[4]);
+         double   p2    = StringToDouble(parts[5]);
+         color    clr   = (color)StringToInteger(parts[6]);
+         color    fill  = (n >= 8)  ? (color)StringToInteger(parts[7]) : clr;
+         int      width = (n >= 9)  ? (int)StringToInteger(parts[8])   : 1;
+         int      style = (n >= 10) ? (int)StringToInteger(parts[9])   : STYLE_SOLID;
+         bool     back  = (n >= 11) ? (bool)StringToInteger(parts[10]) : true;
+         if(ObjectFind(0, nm) >= 0) ObjectDelete(0, nm);
+         if(ObjectCreate(0, nm, OBJ_RECTANGLE, 0, t1, p1, t2, p2))
+           {
+            ObjectSetInteger(0, nm, OBJPROP_COLOR,      clr);
+            ObjectSetInteger(0, nm, OBJPROP_BGCOLOR,    fill);
+            ObjectSetInteger(0, nm, OBJPROP_FILL,       true);
+            ObjectSetInteger(0, nm, OBJPROP_WIDTH,      width);
+            ObjectSetInteger(0, nm, OBJPROP_STYLE,      style);
+            ObjectSetInteger(0, nm, OBJPROP_BACK,       back);
+            ObjectSetInteger(0, nm, OBJPROP_SELECTABLE, false);
+            ObjectSetInteger(0, nm, OBJPROP_HIDDEN,     true);
+           }
+         anyDone = true;
+        }
+      // DRAW_TEXT|name|time|price|text|color|fontsize
+      else if(cmd == "DRAW_TEXT" && n >= 6)
+        {
+         string   nm    = parts[1];
+         datetime t1    = (datetime)StringToInteger(parts[2]);
+         double   p1    = StringToDouble(parts[3]);
+         string   txt   = parts[4];
+         color    clr   = (color)StringToInteger(parts[5]);
+         int      fsz   = (n >= 7) ? (int)StringToInteger(parts[6]) : 8;
+         if(ObjectFind(0, nm) >= 0) ObjectDelete(0, nm);
+         if(ObjectCreate(0, nm, OBJ_TEXT, 0, t1, p1))
+           {
+            ObjectSetString(0,  nm, OBJPROP_TEXT,      txt);
+            ObjectSetInteger(0, nm, OBJPROP_COLOR,     clr);
+            ObjectSetInteger(0, nm, OBJPROP_FONTSIZE,  fsz);
+            ObjectSetString(0,  nm, OBJPROP_FONT,      "Arial Bold");
+            ObjectSetInteger(0, nm, OBJPROP_BACK,      false);
+            ObjectSetInteger(0, nm, OBJPROP_SELECTABLE,false);
+            ObjectSetInteger(0, nm, OBJPROP_HIDDEN,    true);
+           }
+         anyDone = true;
+        }
       else if(cmd == "DELETE" && n >= 2)
         {
          if(ObjectFind(0, parts[1]) >= 0) ObjectDelete(0, parts[1]);
