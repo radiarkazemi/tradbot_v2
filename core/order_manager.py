@@ -23,14 +23,12 @@ ORDER LOGIC:
     MT5 requires minimum stop distance. We fetch the symbol's STOPLEVEL
     and ensure SL is at least that far from entry.
 """
-from config import LOT_SIZE, TP_RR_RATIO, MAGIC_NUMBER
-import MetaTrader5 as mt5
-import logging
-import sys
-import os as _os
-sys.path.insert(0, _os.path.dirname(
-    _os.path.dirname(_os.path.abspath(__file__))))
+import sys, os as _os
+sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 
+import logging
+import MetaTrader5 as mt5
+from config import LOT_SIZE, TP_RR_RATIO, MAGIC_NUMBER
 
 log = logging.getLogger("orders")
 
@@ -42,12 +40,9 @@ def _filling_mode(symbol: str) -> int:
     if info is None:
         return mt5.ORDER_FILLING_RETURN
     m = info.filling_mode
-    if m & 4:
-        return mt5.ORDER_FILLING_RETURN
-    if m & 2:
-        return mt5.ORDER_FILLING_IOC
-    if m & 1:
-        return mt5.ORDER_FILLING_FOK
+    if m & 4: return mt5.ORDER_FILLING_RETURN
+    if m & 2: return mt5.ORDER_FILLING_IOC
+    if m & 1: return mt5.ORDER_FILLING_FOK
     return mt5.ORDER_FILLING_RETURN
 
 
@@ -112,41 +107,35 @@ def build_level_orders(source_price: float, pip_size: float,
     tp_pips = 0: use TP_RR_RATIO per position.
     """
     step = pip_step * pip_size
-    above = [_round_price(source_price + step * i, symbol)
-             for i in range(1, 4)]
-    below = [_round_price(source_price - step * i, symbol)
-             for i in range(1, 4)]
+    above = [_round_price(source_price + step * i, symbol) for i in range(1, 4)]
+    below = [_round_price(source_price - step * i, symbol) for i in range(1, 4)]
 
     # Fixed TP: same TP price for all 3 positions in the round
     fixed_tp_buy = fixed_tp_sell = None
     if tp_pips > 0:
         tp_dist = tp_pips * pip_size
-        fixed_tp_buy = _round_price(
-            above[2] + tp_dist, symbol)  # L3 entry + tp_pips
-        fixed_tp_sell = _round_price(
-            below[2] - tp_dist, symbol)  # L3 entry - tp_pips
+        fixed_tp_buy  = _round_price(above[2] + tp_dist, symbol)  # L3 entry + tp_pips
+        fixed_tp_sell = _round_price(below[2] - tp_dist, symbol)  # L3 entry - tp_pips
         log.info("Fixed TP: BUY_TP=%.5f SELL_TP=%.5f (%g pips from L3)",
                  fixed_tp_buy, fixed_tp_sell, tp_pips)
 
     orders = []
     for i in range(3):
         lvl = i + 1
-        ea = above[i]
-        es = below[i]
+        ea  = above[i]
+        es  = below[i]
 
-        sl_buy = _adjust_sl(ea, es, symbol, True)
+        sl_buy  = _adjust_sl(ea, es, symbol, True)
         sl_sell = _adjust_sl(es, ea, symbol, False)
-        dist_b = ea - sl_buy
-        dist_s = sl_sell - es
+        dist_b  = ea - sl_buy
+        dist_s  = sl_sell - es
 
         if fixed_tp_buy is not None:
-            tp_buy = _adjust_tp(ea, fixed_tp_buy,  symbol, True)
+            tp_buy  = _adjust_tp(ea, fixed_tp_buy,  symbol, True)
             tp_sell = _adjust_tp(es, fixed_tp_sell, symbol, False)
         else:
-            tp_buy = _adjust_tp(ea, _round_price(
-                ea + dist_b * TP_RR_RATIO, symbol), symbol, True)
-            tp_sell = _adjust_tp(es, _round_price(
-                es - dist_s * TP_RR_RATIO, symbol), symbol, False)
+            tp_buy  = _adjust_tp(ea, _round_price(ea + dist_b * TP_RR_RATIO, symbol), symbol, True)
+            tp_sell = _adjust_tp(es, _round_price(es - dist_s * TP_RR_RATIO, symbol), symbol, False)
 
         orders.append({
             "level": lvl, "generation": generation, "source": source_price,
@@ -163,11 +152,13 @@ def build_level_orders(source_price: float, pip_size: float,
 
 def send_orders(orders: list, symbol: str, lot_size: float = None) -> list:
     """Send order dicts to MT5. Returns results list."""
-    # Ensure MT5 is initialized — retry up to 3 times
     import time as _t
+    from config import MT5_LOGIN, MT5_PASSWORD, MT5_SERVER
+
+    # Ensure MT5 is initialized with credentials — retry up to 3 times
     initialized = False
     for _attempt in range(3):
-        if mt5.initialize():
+        if mt5.initialize(login=MT5_LOGIN, password=MT5_PASSWORD, server=MT5_SERVER):
             initialized = True
             break
         _t.sleep(0.5)
@@ -194,7 +185,7 @@ def send_orders(orders: list, symbol: str, lot_size: float = None) -> list:
         # Safety checks before placing pending order:
         if current_price > 0:
             min_dist = _min_stop_distance(symbol)
-            entry = o["entry"]
+            entry    = o["entry"]
 
             # 1. Entry must be on correct side of current price
             if is_buy and current_price >= entry:

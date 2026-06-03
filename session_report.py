@@ -6,7 +6,7 @@ import csv
 from datetime import datetime
 import MetaTrader5 as mt5
 
-from config import MAGIC_NUMBER
+from config import MAGIC_NUMBER, MT5_LOGIN, MT5_PASSWORD, MT5_SERVER
 
 
 def fetch_session_events(symbol: str, session_start: datetime) -> dict:
@@ -14,8 +14,8 @@ def fetch_session_events(symbol: str, session_start: datetime) -> dict:
     Fetch all closed + open bot positions since session_start.
     Returns a dict with: events[], wins, losses, rf_exits, total_pnl, best_pnl, worst_pnl
     """
-    if not mt5.initialize():
-        raise RuntimeError("MT5 not initialized")
+    # Initialize with credentials — safe to call even if already initialized
+    mt5.initialize(login=MT5_LOGIN, password=MT5_PASSWORD, server=MT5_SERVER)
 
     t_from = session_start
     t_to   = datetime.now()

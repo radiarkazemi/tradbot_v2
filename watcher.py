@@ -191,8 +191,11 @@ class WatcherWorker(threading.Thread):
                     reg["l3_activated_candle_t"] = self._last_prev_t
                     reg["_last_candle_counted"]  = self._last_prev_t
                     reg["candles_since_l3"]      = 0
-                    reg["price_was_away"]        = False
-                    self.log(f"   ✅ Pullback re-armed on main source @ {reg['src']:.5f}")
+                    # Price already moved away (it just hit G1-L3 which is
+                    # 3 steps from the source) — set price_was_away immediately
+                    reg["price_was_away"]        = True
+                    self.log(f"   ✅ Pullback re-armed on main source @ {reg['src']:.5f}"
+                             f" | price_was_away=True (already at G1-L3 distance)")
                 break
 
             spawn_key = f"{entry:.5f}_G{gen+1}_{direction[:4]}"
@@ -259,8 +262,8 @@ class WatcherWorker(threading.Thread):
             cnt += 1
             reg["candles_since_l3"] = cnt
 
-        if cnt < 5:
-            return  # wait for at least 5 full candles after L3
+        # No minimum candle wait — same-candle protection is handled by
+        # registered_at_candle in the touch detection block
 
         if prev_h <= 0 or prev_l <= 0:
             return
