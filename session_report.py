@@ -18,7 +18,7 @@ def fetch_session_events(symbol: str, session_start: datetime) -> dict:
     mt5.initialize(login=MT5_LOGIN, password=MT5_PASSWORD, server=MT5_SERVER)
 
     t_from = session_start
-    t_to   = datetime.now()
+    t_to = datetime.now()
 
     # All deals in the session window
     deals = mt5.history_deals_get(t_from, t_to) or []
@@ -47,7 +47,7 @@ def fetch_session_events(symbol: str, session_start: datetime) -> dict:
     events = []
     total_pnl = 0.0
     wins = losses = rf_exits = 0
-    best_pnl  = float("-inf")
+    best_pnl = float("-inf")
     worst_pnl = float("inf")
 
     for pid, pair in pos_map.items():
@@ -70,17 +70,29 @@ def fetch_session_events(symbol: str, session_start: datetime) -> dict:
         else:
             pips = 0.0
 
-        # Determine close reason
+        # Determine close reason — get SL/TP from history orders (deals have no sl/tp)
+        entry_sl = 0.0
+        entry_tp = 0.0
+        try:
+            orders = mt5.history_orders_get(position=pid)
+            if orders:
+                entry_sl = orders[0].sl or 0.0
+                entry_tp = orders[0].tp or 0.0
+        except Exception:
+            pass
+
         reason = "Open"
         if c:
             cmt = (c.comment or "").upper()
             if "RF" in cmt or "RISK" in cmt:
                 reason = "Risk-Free 🛡"
-            elif "RESET" in cmt:
-                reason = "Manual Reset"
-            elif abs(c.price - (o.sl or 0)) < pip_size * 2:
+            elif "RESET" in cmt or "AUTOCLOSE" in cmt:
+                reason = "Auto-Close 🤖"
+            elif "PULLBACK" in cmt:
+                reason = "Pullback Close"
+            elif entry_sl and abs(c.price - entry_sl) < pip_size * 2:
                 reason = "SL ❌"
-            elif abs(c.price - (o.tp or 0)) < pip_size * 2:
+            elif entry_tp and abs(c.price - entry_tp) < pip_size * 2:
                 reason = "TP ✅"
             else:
                 reason = "Manual"
@@ -92,30 +104,15 @@ def fetch_session_events(symbol: str, session_start: datetime) -> dict:
                 losses += 1
             if "Risk" in reason:
                 rf_exits += 1
-            best_pnl  = max(best_pnl, pnl)
+            best_pnl = max(best_pnl, pnl)
             worst_pnl = min(worst_pnl, pnl)
 
         # Parse gen/level from comment if available
-        gen_lvl = ""
         import re
+        gen_lvl = ""
         m = re.search(r'G(\d+)L(\d+)', o.comment or "")
         if m:
             gen_lvl = f"G{m.group(1)}-L{m.group(2)}"
-
-        # Get SL/TP from the open deal (entry deal) — deals don't have sl/tp,
-        # so we look them up from the position history via positions_get or
-        # use the order that created this position
-        entry_sl = getattr(o, 'sl', None) or 0.0
-        entry_tp = getattr(o, 'tp', None) or 0.0
-        # TradeDeal has no sl/tp — try to get from history orders for this position
-        if entry_sl == 0.0:
-            try:
-                orders = mt5.history_orders_get(position=pid)
-                if orders:
-                    entry_sl = orders[0].sl or 0.0
-                    entry_tp = orders[0].tp or 0.0
-            except Exception:
-                pass
 
         events.append({
             "time":    datetime.fromtimestamp(o.time).strftime("%m-%d %H:%M:%S"),
@@ -136,7 +133,7 @@ def fetch_session_events(symbol: str, session_start: datetime) -> dict:
     # Add still-open positions
     for p in open_pos:
         tick = mt5.symbol_info_tick(p.symbol)
-        cur  = (tick.bid + tick.ask) / 2 if tick else 0.0
+        cur = (tick.bid + tick.ask) / 2 if tick else 0.0
         import re
         m = re.search(r'G(\d+)L(\d+)', p.comment or "")
         gen_lvl = f"G{m.group(1)}-L{m.group(2)}" if m else ""
@@ -165,15 +162,16 @@ def fetch_session_events(symbol: str, session_start: datetime) -> dict:
         "losses":    losses,
         "rf_exits":  rf_exits,
         "total_pnl": total_pnl,
-        "best_pnl":  best_pnl  if best_pnl  != float("-inf") else 0.0,
-        "worst_pnl": worst_pnl if worst_pnl != float("inf")  else 0.0,
+        "best_pnl":  best_pnl if best_pnl != float("-inf") else 0.0,
+        "worst_pnl": worst_pnl if worst_pnl != float("inf") else 0.0,
         "open_count": len(open_pos),
     }
 
 
 def export_csv(events: list, filepath: str):
     """Write events list to a CSV file."""
-    cols = ["time","symbol","gen_lvl","type","entry","close","sl","tp","pnl","pips","reason"]
+    cols = ["time", "symbol", "gen_lvl", "type", "entry",
+            "close", "sl", "tp", "pnl", "pips", "reason"]
     with open(filepath, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
         w.writeheader()
@@ -183,8 +181,8 @@ def export_csv(events: list, filepath: str):
 def export_txt(events: list, session_start: datetime, symbol: str, filepath: str):
     """Write a human-readable text report."""
     closed = [e for e in events if e["_closed"]]
-    opens  = [e for e in events if not e["_closed"]]
-    wins   = [e for e in closed if e["_pnl_v"] > 0]
+    opens = [e for e in events if not e["_closed"]]
+    wins = [e for e in closed if e["_pnl_v"] > 0]
     losses = [e for e in closed if e["_pnl_v"] <= 0]
     total_pnl = sum(e["_pnl_v"] for e in closed)
     wr = len(wins) / len(closed) * 100 if closed else 0

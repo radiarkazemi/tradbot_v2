@@ -9,7 +9,7 @@ import MetaTrader5 as mt5
 from config import (
     WATCH_SYMBOL, SCAN_INTERVAL_SEC, MAGIC_NUMBER, PIP_STEP, LOT_SIZE,
 )
-from core.line_drawer  import get_pip_size, write_commands
+from core.line_drawer import get_pip_size, write_commands
 from core.order_manager import place_level_orders, cancel_all_tb_orders
 from core import chart_watcher as cw
 
@@ -19,30 +19,31 @@ class WatcherWorker(threading.Thread):
                  tp_pips: float = 0.0, spawn_on: str = "L2 and L3",
                  lot_size: float = LOT_SIZE):
         super().__init__(daemon=True)
-        self.sig            = sig
-        self.pip_step       = pip_step
-        self.symbol         = symbol
-        self.tp_pips        = tp_pips
-        self.spawn_on       = spawn_on
-        self.lot_size       = lot_size
-        self._stop          = threading.Event()
-        self.prev_names     = set()
-        self.drawn          = {}
+        self.sig = sig
+        self.pip_step = pip_step
+        self.symbol = symbol
+        self.tp_pips = tp_pips
+        self.spawn_on = spawn_on
+        self.lot_size = lot_size
+        self._stop = threading.Event()
+        self.prev_names = set()
+        self.drawn = {}
         self.follow_enabled = True
-        self.orders_placed  = set()
+        self.orders_placed = set()
         self._last_direction = "—"
         # Phase 3
         self.pending_tracker = {}   # ticket → order_info
-        self.spawn_rounds    = 0
-        self.spawned_keys    = set()
-        self._last_prev_t    = 0    # shared with _check_phase3_activations
+        self.spawn_rounds = 0
+        self.spawned_keys = set()
+        self._last_prev_t = 0    # shared with _check_phase3_activations
         # exposed to GUI
         self.source_registry = {}   # set in run()
 
     def stop(self): self._stop.set()
 
     def log(self, msg, lvl="INFO"):
-        self.sig.log_line.emit(f"{datetime.now().strftime('%H:%M:%S')}  {msg}", lvl)
+        self.sig.log_line.emit(
+            f"{datetime.now().strftime('%H:%M:%S')}  {msg}", lvl)
 
     # ── Chart drawing ─────────────────────────────────────────────
 
@@ -52,9 +53,9 @@ class WatcherWorker(threading.Thread):
         return f"TB_{hashlib.md5(name.encode()).hexdigest()[:6].upper()}_"
 
     def _draw_hline_levels(self, name, price, pip_size):
-        prefix  = self._obj_prefix(name)
-        step    = self.pip_step * pip_size
-        l3_buy  = round(price + step * 3, 5)
+        prefix = self._obj_prefix(name)
+        step = self.pip_step * pip_size
+        l3_buy = round(price + step * 3, 5)
         l3_sell = round(price - step * 3, 5)
         write_commands([
             f"DELETE_PREFIX|{prefix}",
@@ -71,7 +72,7 @@ class WatcherWorker(threading.Thread):
             results = place_level_orders(
                 source_price, pip_size, self.pip_step, self.symbol,
                 generation, tp_pips=self.tp_pips, lot_size=self.lot_size)
-            ok     = sum(1 for r in results if r["ok"])
+            ok = sum(1 for r in results if r["ok"])
             failed = [r for r in results if not r["ok"]]
 
             for r in results:
@@ -85,7 +86,8 @@ class WatcherWorker(threading.Thread):
 
             step = self.pip_step * pip_size
             if ok == len(results):
-                self.log(f"📋  G{generation}: {ok}/6 placed @ {source_price:.5f} | step={step:.5f}")
+                self.log(
+                    f"📋  G{generation}: {ok}/6 placed @ {source_price:.5f} | step={step:.5f}")
                 for r in results:
                     o = r["order"]
                     icon = "🟢" if o["type"] == "BUY_STOP" else "🔴"
@@ -93,12 +95,14 @@ class WatcherWorker(threading.Thread):
                              f" entry={o['entry']:.5f} sl={o['sl']:.5f} tp={o['tp']:.5f}")
             else:
                 reasons = set(r.get("reason", "?") for r in failed)
-                self.log(f"⚠️  G{generation}: {ok}/6 placed | failed: {', '.join(reasons)}", "WARN")
+                self.log(
+                    f"⚠️  G{generation}: {ok}/6 placed | failed: {', '.join(reasons)}", "WARN")
                 for r in results:
                     o = r["order"]
-                    icon   = "🟢" if o["type"] == "BUY_STOP" else "🔴"
-                    status = "✅" if r["ok"] else f"❌({r.get('reason','?')[:20]})"
-                    self.log(f"   {icon} {status} {o['type']:10s} entry={o['entry']:.5f} sl={o['sl']:.5f}")
+                    icon = "🟢" if o["type"] == "BUY_STOP" else "🔴"
+                    status = "✅" if r["ok"] else f"❌({r.get('reason', '?')[:20]})"
+                    self.log(
+                        f"   {icon} {status} {o['type']:10s} entry={o['entry']:.5f} sl={o['sl']:.5f}")
         except Exception as e:
             self.log(f"💥  Order error: {type(e).__name__}: {e}", "ERROR")
 
@@ -135,12 +139,13 @@ class WatcherWorker(threading.Thread):
             if level == 3:
                 for reg in self.source_registry.values():
                     if abs(reg.get("src", 0) - info.get("source", entry)) < 0.000001:
-                        reg["l3_activated"]          = True
+                        reg["l3_activated"] = True
                         reg["l3_activated_candle_t"] = self._last_prev_t
-                        reg["_last_candle_counted"]  = self._last_prev_t
-                        reg["candles_since_l3"]      = 0
-                        reg["price_was_away"]        = False
-                        self.log(f"   ✅ L3 hit — pullback armed (needs 5+ candles away from source)")
+                        reg["_last_candle_counted"] = self._last_prev_t
+                        reg["candles_since_l3"] = 0
+                        reg["price_was_away"] = False
+                        self.log(
+                            f"   ✅ L3 hit — pullback armed (needs 5+ candles away from source)")
 
             del self.pending_tracker[ticket]
 
@@ -162,19 +167,23 @@ class WatcherWorker(threading.Thread):
         self._spawn_cooldown_logged = False
 
         spawn_lvls = []
-        if "L2" in self.spawn_on: spawn_lvls.append(2)
-        if "L3" in self.spawn_on: spawn_lvls.append(3)
+        if "L2" in self.spawn_on:
+            spawn_lvls.append(2)
+        if "L3" in self.spawn_on:
+            spawn_lvls.append(3)
 
         candidates = sorted(triggered.items(),
                             key=lambda kv: (-kv[1]["level"], kv[1]["generation"]))
 
         for ticket, info in candidates:
-            level, gen   = info["level"], info["generation"]
+            level, gen = info["level"], info["generation"]
             entry, direction = info["entry"], info["direction"]
 
-            if level not in spawn_lvls: continue
+            if level not in spawn_lvls:
+                continue
             if self.spawn_rounds >= 9:
-                self.log("⛔  Max 9 rounds reached — no more spawning"); break
+                self.log("⛔  Max 9 rounds reached — no more spawning")
+                break
 
             # WWW/MMM pattern: G0 → G1 is the max depth.
             # When G1 L3 hits, don't spawn G2 — instead arm pullback on the
@@ -187,20 +196,21 @@ class WatcherWorker(threading.Thread):
                 for reg in self.source_registry.values():
                     if not reg.get("triggered"):
                         continue
-                    reg["l3_activated"]          = True
+                    reg["l3_activated"] = True
                     reg["l3_activated_candle_t"] = self._last_prev_t
-                    reg["_last_candle_counted"]  = self._last_prev_t
-                    reg["candles_since_l3"]      = 0
+                    reg["_last_candle_counted"] = self._last_prev_t
+                    reg["candles_since_l3"] = 0
                     # Price already moved away (it just hit G1-L3 which is
                     # 3 steps from the source) — set price_was_away immediately
-                    reg["price_was_away"]        = True
+                    reg["price_was_away"] = True
                     self.log(f"   ✅ Pullback re-armed on main source @ {reg['src']:.5f}"
                              f" | price_was_away=True (already at G1-L3 distance)")
                 break
 
-            spawn_key = f"{entry:.5f}_G{gen+1}_{direction[:4]}"
+            spawn_key = f"{entry:.5f}_G{gen+1}_{direction[:4]}_R{self.spawn_rounds}"
             if spawn_key in self.spawned_keys:
-                self.log(f"ℹ️  Already spawned from {entry:.5f} {direction[:4]} — skipping")
+                self.log(
+                    f"ℹ️  Already spawned from {entry:.5f} {direction[:4]} — skipping")
                 continue
 
             self.spawned_keys.add(spawn_key)
@@ -210,7 +220,8 @@ class WatcherWorker(threading.Thread):
             self.log(f"🔄  Phase 3 round {self.spawn_rounds}/9 — "
                      f"G{gen}-L{level} {direction} @ {entry:.5f} → "
                      f"new source G{new_gen} @ {entry:.5f}", "NEW")
-            self._draw_hline_levels(f"TB_SPAWN_G{new_gen}_R{self.spawn_rounds}", entry, pip)
+            self._draw_hline_levels(
+                f"TB_SPAWN_G{new_gen}_R{self.spawn_rounds}", entry, pip)
             self._place_orders_for_source(entry, pip, generation=new_gen)
             self._log_position_map()
             break  # one spawn per cycle
@@ -225,7 +236,7 @@ class WatcherWorker(threading.Thread):
             for o in sorted(bot_orders, key=lambda x: x.price_open):
                 t = "BUY_STOP" if o.type == 2 else "SELL_STOP"
                 self.log(f"   #{o.ticket} {t:10s} entry={o.price_open:.5f} "
-                         f"sl={o.sl:.5f} tp={o.tp:.5f} | {getattr(o,'comment','')}")
+                         f"sl={o.sl:.5f} tp={o.tp:.5f} | {getattr(o, 'comment', '')}")
         positions = mt5.positions_get(symbol=self.symbol)
         bot_pos = [p for p in (positions or []) if p.magic == MAGIC_NUMBER]
         if bot_pos:
@@ -248,13 +259,13 @@ class WatcherWorker(threading.Thread):
             return  # cascade exhausted — no more pullback rounds
         if not reg.get("l3_activated", False):
             return
-        src       = reg["src"]
-        prev_t    = candle.get("PREV_T", 0)
-        prev_h    = candle.get("PREV_H", 0.0)
-        prev_l    = candle.get("PREV_L", 0.0)
-        prev_o    = candle.get("PREV_O", 0.0)
-        l3_t      = reg.get("l3_activated_candle_t", 0)
-        cnt       = reg.get("candles_since_l3", 0)
+        src = reg["src"]
+        prev_t = candle.get("PREV_T", 0)
+        prev_h = candle.get("PREV_H", 0.0)
+        prev_l = candle.get("PREV_L", 0.0)
+        prev_o = candle.get("PREV_O", 0.0)
+        l3_t = reg.get("l3_activated_candle_t", 0)
+        cnt = reg.get("candles_since_l3", 0)
 
         # Count new candles since L3 (only count each PREV_T once, and only after L3)
         if prev_t > reg.get("_last_candle_counted", 0) and prev_t > l3_t:
@@ -274,33 +285,92 @@ class WatcherWorker(threading.Thread):
         elif reg.get("price_was_away", False):
             last_rb = reg.get("last_pullback_t", 0)
             if prev_t > last_rb:
-                reg["last_pullback_t"]   = prev_t
-                reg["price_was_away"]    = False
-                reg["candles_since_l3"]  = 0
+                reg["last_pullback_t"] = prev_t
+                reg["price_was_away"] = False
+                reg["candles_since_l3"] = 0
                 side = "from above" if prev_o > src else "from below"
 
-                # Cancel only G0 pending orders before placing fresh round
-                pending = mt5.orders_get(symbol=self.symbol) or []
-                cancelled = 0
-                for o in pending:
-                    cmt = getattr(o, "comment", "")
-                    if o.magic == MAGIC_NUMBER and "_G0L" in str(cmt):
-                        r = mt5.order_send({"action": mt5.TRADE_ACTION_REMOVE, "order": o.ticket})
-                        if r and r.retcode == 10009:
-                            cancelled += 1
-                if cancelled:
-                    self.log(f"🗑️  Cancelled {cancelled} G0 pending orders before pullback")
+                # Cancel ALL existing bot pending orders before placing fresh round
+                # G1 orders accumulate across rounds if not cancelled — cancel everything
+                import MetaTrader5 as _mt5pb
+                pending_now = _mt5pb.orders_get(symbol=self.symbol) or []
+                g0_done = g1_done = other_done = 0
+                for _o in pending_now:
+                    if _o.magic != MAGIC_NUMBER:
+                        continue
+                    cmt = str(getattr(_o, 'comment', '') or '')
+                    # Cancel all bot pending orders — TB_ prefix covers all levels
+                    if cmt.startswith('TB_'):
+                        _r = _mt5pb.order_send({
+                            "action": _mt5pb.TRADE_ACTION_REMOVE,
+                            "order":  _o.ticket,
+                        })
+                        if _r and _r.retcode in (10009, 10008):
+                            if 'G0' in cmt:
+                                g0_done += 1
+                            elif 'G1' in cmt:
+                                g1_done += 1
+                            else:
+                                other_done += 1
+                total_cancelled = g0_done + g1_done + other_done
+                self.log(f"🗑️  Cancelled {total_cancelled} pending orders before pullback "
+                         f"(G0={g0_done} G1={g1_done} other={other_done})")
 
-                self.log(f"🔁  Pullback [{n[:20]}] @ {src:.5f} {side} | placing fresh G0 round", "NEW")
+                self.log(
+                    f"🔁  Pullback [{n[:20]}] @ {src:.5f} {side} | placing fresh G0 round", "NEW")
 
                 # Reset G1 spawn keys so the next G0-L3 can spawn G1 again
-                # Keep the spawn_rounds counter running (counts total W/M legs)
-                # Remove only G1-level spawn keys — G0→G1 spawns must be allowed again
                 keys_to_remove = {k for k in self.spawned_keys if "_G1_" in k}
                 self.spawned_keys -= keys_to_remove
                 if keys_to_remove:
                     self.log(f"   ♻️  Reset {len(keys_to_remove)} G1 spawn key(s) — "
                              f"next G0-L3 will spawn G1 again")
+
+                # Determine pullback direction and close opposing active positions
+                # Prevents BUY+SELL positions from hedging each other
+                pullback_direction = "BUY" if prev_o < src else "SELL"
+                import MetaTrader5 as _mt5cl
+                active_pos = _mt5cl.positions_get(symbol=self.symbol) or []
+                close_type_map = {0: _mt5cl.ORDER_TYPE_SELL,
+                                  1: _mt5cl.ORDER_TYPE_BUY}
+                closed_opp = 0
+                for _p in active_pos:
+                    if _p.magic != MAGIC_NUMBER:
+                        continue
+                    is_buy = _p.type == 0
+                    # Close BUY positions if price came from below (sell pullback)
+                    # Close SELL positions if price came from above (buy pullback)
+                    should_close = (pullback_direction == "SELL" and is_buy) or \
+                                   (pullback_direction == "BUY" and not is_buy)
+                    if not should_close:
+                        continue
+                    tick = _mt5cl.symbol_info_tick(self.symbol)
+                    if not tick:
+                        continue
+                    close_t = close_type_map[_p.type]
+                    close_price = tick.bid if close_t == _mt5cl.ORDER_TYPE_SELL else tick.ask
+                    for filling in (_mt5cl.ORDER_FILLING_FOK,
+                                    _mt5cl.ORDER_FILLING_IOC,
+                                    _mt5cl.ORDER_FILLING_RETURN):
+                        _r = _mt5cl.order_send({
+                            "action":       _mt5cl.TRADE_ACTION_DEAL,
+                            "symbol":       self.symbol,
+                            "volume":       _p.volume,
+                            "type":         close_t,
+                            "position":     _p.ticket,
+                            "price":        close_price,
+                            "deviation":    50,
+                            "magic":        MAGIC_NUMBER,
+                            "comment":      "TB_PULLBACK_CLOSE",
+                            "type_time":    _mt5cl.ORDER_TIME_GTC,
+                            "type_filling": filling,
+                        })
+                        if _r and _r.retcode == 10009:
+                            closed_opp += 1
+                            break
+                if closed_opp:
+                    self.log(f"   🗑️  Closed {closed_opp} opposing positions on pullback "
+                             f"({pullback_direction} bias)")
 
                 self._place_orders_for_source(src, pip, generation=0)
 
@@ -320,7 +390,8 @@ class WatcherWorker(threading.Thread):
             min_pips = min_dist / pip if pip > 0 else 0
             self.log(f"✅  Connected | {self.symbol} | pip={pip:.5f} | "
                      f"step={self.pip_step} pips | TP={self.tp_pips:.0f}pips | spawn={self.spawn_on}")
-            self.log(f"📐  Min stop distance: {min_dist:.5f} = {min_pips:.1f} pips")
+            self.log(
+                f"📐  Min stop distance: {min_dist:.5f} = {min_pips:.1f} pips")
         else:
             self.log(f"✅  Connected | {self.symbol} | pip={pip:.5f}")
 
@@ -328,7 +399,8 @@ class WatcherWorker(threading.Thread):
         source_registry = {}
         self.source_registry = source_registry
 
-        import os as _os, time as _time
+        import os as _os
+        import time as _time
 
         while not self._stop.is_set():
             try:
@@ -345,24 +417,30 @@ class WatcherWorker(threading.Thread):
                             if line.startswith("SYMBOL:"):
                                 file_sym = line.split(":", 1)[1].strip()
                                 if file_sym != self.symbol:
-                                    self.log(f"⚠️  File symbol '{file_sym}' ≠ bot symbol '{self.symbol}'", "WARN")
+                                    self.log(
+                                        f"⚠️  File symbol '{file_sym}' ≠ bot symbol '{self.symbol}'", "WARN")
                                 break
                     except Exception:
                         pass
 
                 if not path:
                     self.sig.status.emit("⏳  Waiting for EA…")
-                    self._stop.wait(min(SCAN_INTERVAL_SEC, 1)); continue
+                    self._stop.wait(min(SCAN_INTERVAL_SEC, 1))
+                    continue
 
                 # Stale file check
-                try: file_age = _time.time() - _os.path.getmtime(path)
-                except: file_age = 0
+                try:
+                    file_age = _time.time() - _os.path.getmtime(path)
+                except:
+                    file_age = 0
                 if file_age > 15:
                     if not getattr(self, "_stale_warned", False) or int(file_age) % 30 < 1:
                         self._stale_warned = True
-                        self.log(f"⚠️  EA file {file_age:.0f}s old — EA not running on {self.symbol} chart", "WARN")
+                        self.log(
+                            f"⚠️  EA file {file_age:.0f}s old — EA not running on {self.symbol} chart", "WARN")
                     self.sig.status.emit(f"⚠️  EA stopped ({file_age:.0f}s)")
-                    self._stop.wait(min(SCAN_INTERVAL_SEC, 1)); continue
+                    self._stop.wait(min(SCAN_INTERVAL_SEC, 1))
+                    continue
                 else:
                     if getattr(self, "_stale_warned", False):
                         self.log("✅  EA writing again — resuming")
@@ -373,9 +451,11 @@ class WatcherWorker(threading.Thread):
                 if len(parsed) == 4:
                     trader, auto, ea_sym, candle = parsed
                 elif len(parsed) == 3:
-                    trader, auto, ea_sym, candle = parsed[0], parsed[1], parsed[2], {}
+                    trader, auto, ea_sym, candle = parsed[0], parsed[1], parsed[2], {
+                    }
                 else:
-                    trader, auto, ea_sym, candle = parsed[0], parsed[1], None, {}
+                    trader, auto, ea_sym, candle = parsed[0], parsed[1], None, {
+                    }
 
                 if ea_sym:
                     self.sig.log_line.emit(f"__EA_SYM__{ea_sym}", "EA")
@@ -383,8 +463,10 @@ class WatcherWorker(threading.Thread):
                 if ea_sym and ea_sym != self.symbol:
                     if ea_sym != getattr(self, "_last_ea_warn", None):
                         self._last_ea_warn = ea_sym
-                        self.log(f"⚠️  EA on '{ea_sym}' chart — not '{self.symbol}'", "WARN")
-                    self._stop.wait(min(SCAN_INTERVAL_SEC, 1)); continue
+                        self.log(
+                            f"⚠️  EA on '{ea_sym}' chart — not '{self.symbol}'", "WARN")
+                    self._stop.wait(min(SCAN_INTERVAL_SEC, 1))
+                    continue
 
                 self.sig.new_objects.emit(trader, auto)
 
@@ -395,13 +477,15 @@ class WatcherWorker(threading.Thread):
                                for k, v in source_registry.items() if not v.get("triggered")]
                     if waiting:
                         bid = candle.get("BID", 0)
-                        ch  = candle.get("CANDLE_H", 0)
-                        cl  = candle.get("CANDLE_L", 0)
+                        ch = candle.get("CANDLE_H", 0)
+                        cl = candle.get("CANDLE_L", 0)
                         try:
                             age = int(_time.time() - _os.path.getmtime(path))
                             age_s = f" | file_age={age}s"
-                        except: age_s = ""
-                        self.log(f"⏳  Watching: {', '.join(waiting)} | bid={bid:.5f} H={ch:.5f} L={cl:.5f}{age_s}")
+                        except:
+                            age_s = ""
+                        self.log(
+                            f"⏳  Watching: {', '.join(waiting)} | bid={bid:.5f} H={ch:.5f} L={cl:.5f}{age_s}")
 
                 # Send candle data to GUI (for RF check)
                 self.sig.log_line.emit(f"__CANDLE__{repr(candle)}", "RF")
@@ -412,10 +496,10 @@ class WatcherWorker(threading.Thread):
 
                 # ── Candle data ──────────────────────────────────
                 cur_candle_t = candle.get("CANDLE_T", 0)
-                cur_h  = candle.get("CANDLE_H", current_price)
-                cur_l  = candle.get("CANDLE_L", current_price)
-                cur_c  = candle.get("CANDLE_C", current_price)
-                cur_o  = candle.get("CANDLE_O", current_price)
+                cur_h = candle.get("CANDLE_H", current_price)
+                cur_l = candle.get("CANDLE_L", current_price)
+                cur_c = candle.get("CANDLE_C", current_price)
+                cur_o = candle.get("CANDLE_O", current_price)
                 prev_h = candle.get("PREV_H", 0.0)
                 prev_l = candle.get("PREV_L", 0.0)
                 prev_c = candle.get("PREV_C", 0.0)
@@ -453,7 +537,8 @@ class WatcherWorker(threading.Thread):
                     elif obj.is_rectangle:
                         if not obj.rect_valid:
                             self.drawn[n] = "INVALID"
-                            self.log(f"⚠️  [{n[:25]}] rectangle has zero height — skipping")
+                            self.log(
+                                f"⚠️  [{n[:25]}] rectangle has zero height — skipping")
                             continue
                         center = round((obj.rect_top + obj.rect_bottom) / 2, 5)
                         self._draw_hline_levels(n, center, pip)
@@ -464,7 +549,8 @@ class WatcherWorker(threading.Thread):
                             "registered_at_candle": prev_t_reg,
                             "last_prev_t": prev_t_reg,
                         }
-                        self.log(f"🆕  RECT [{n[:25]}] center={center:.5f} | waiting for touch")
+                        self.log(
+                            f"🆕  RECT [{n[:25]}] center={center:.5f} | waiting for touch")
 
                 # ── Touch detection & pullback ───────────────────
                 for n, reg in list(source_registry.items()):
@@ -472,9 +558,9 @@ class WatcherWorker(threading.Thread):
                         self._check_pullback(n, reg, candle, pip)
                         continue
 
-                    src           = reg["src"]
+                    src = reg["src"]
                     registered_at = reg.get("registered_at_candle", 0)
-                    touched       = False
+                    touched = False
                     touch_h = touch_l = touch_c = touch_o = 0.0
 
                     # ── Check 1: Current forming candle ──────────
@@ -489,7 +575,7 @@ class WatcherWorker(threading.Thread):
                     # Catches cases where the bot wasn't running when
                     # the candle closed through the line.
                     if not touched and prev_h > 0:
-                        prev_t_val   = candle.get("PREV_T", 0)
+                        prev_t_val = candle.get("PREV_T", 0)
                         last_checked = reg.get("last_prev_t", 0)
                         if prev_t_val > last_checked and prev_t_val > registered_at:
                             reg["last_prev_t"] = prev_t_val
@@ -498,16 +584,17 @@ class WatcherWorker(threading.Thread):
                                 touch_h, touch_l, touch_c, touch_o = prev_h, prev_l, prev_c, prev_o
 
                     if touched:
-                        reg["triggered"]      = True
-                        reg["last_touch_t"]   = candle.get("PREV_T", 0)
+                        reg["triggered"] = True
+                        reg["last_touch_t"] = candle.get("PREV_T", 0)
                         reg["last_pullback_t"] = candle.get("PREV_T", 0)
-                        side      = "from above" if touch_o > src else "from below"
+                        side = "from above" if touch_o > src else "from below"
                         direction = "BUY" if touch_c > src else "SELL"
-                        self._last_direction  = direction
+                        self._last_direction = direction
                         icon = "🟢" if direction == "BUY" else "🔴"
                         self.log(f"🎯  [{n[:20]}] touched @ {src:.5f} {side} | "
                                  f"C={touch_c:.5f} → {icon} {direction} bias | placing orders", "NEW")
-                        self._place_orders_for_source(src, pip, generation=reg["gen"])
+                        self._place_orders_for_source(
+                            src, pip, generation=reg["gen"])
                         reg["cancel_opposite"] = direction
 
                 # ── Cancel opposite-side orders ──────────────────
@@ -518,18 +605,21 @@ class WatcherWorker(threading.Thread):
                     pending = mt5.orders_get(symbol=self.symbol) or []
                     cancelled = 0
                     for o in pending:
-                        if o.magic != MAGIC_NUMBER: continue
-                        is_buy_stop  = o.type == 2
+                        if o.magic != MAGIC_NUMBER:
+                            continue
+                        is_buy_stop = o.type == 2
                         is_sell_stop = o.type == 4
-                        should = ((direction == "BUY"  and is_sell_stop) or
+                        should = ((direction == "BUY" and is_sell_stop) or
                                   (direction == "SELL" and is_buy_stop))
                         if should:
-                            r = mt5.order_send({"action": mt5.TRADE_ACTION_REMOVE, "order": o.ticket})
+                            r = mt5.order_send(
+                                {"action": mt5.TRADE_ACTION_REMOVE, "order": o.ticket})
                             if r and r.retcode == mt5.TRADE_RETCODE_DONE:
                                 cancelled += 1
                     if cancelled:
                         icon = "🟢" if direction == "BUY" else "🔴"
-                        self.log(f"🗑️  {icon} {direction} bias: cancelled {cancelled} opposite-side orders")
+                        self.log(
+                            f"🗑️  {icon} {direction} bias: cancelled {cancelled} opposite-side orders")
 
                 # ── Phase 3 ──────────────────────────────────────
                 self._check_phase3_activations(pip)
@@ -547,18 +637,19 @@ class WatcherWorker(threading.Thread):
                         if obj.is_hline and isinstance(stored, float):
                             if abs(obj.price1 - stored) > 0.000001:
                                 new_src = obj.price1
-                                self.log(f"↕️  [{n[:25]}] moved {stored:.5f}→{new_src:.5f} — redrawing")
+                                self.log(
+                                    f"↕️  [{n[:25]}] moved {stored:.5f}→{new_src:.5f} — redrawing")
                                 self._draw_hline_levels(n, new_src, pip)
                                 self.drawn[n] = new_src
                                 if n in source_registry:
-                                    source_registry[n]["src"]                   = new_src
-                                    source_registry[n]["triggered"]             = False
+                                    source_registry[n]["src"] = new_src
+                                    source_registry[n]["triggered"] = False
                                     # Use PREV_T not cur_candle_t — touch check
                                     # requires prev_t > registered_at, and prev_t
                                     # is always less than cur_candle_t (forming bar)
                                     prev_t_now = candle.get("PREV_T", 0)
                                     source_registry[n]["registered_at_candle"] = prev_t_now
-                                    source_registry[n]["last_prev_t"]          = prev_t_now
+                                    source_registry[n]["last_prev_t"] = prev_t_now
 
                 self.prev_names = self.prev_names | cur
                 self._stop.wait(min(SCAN_INTERVAL_SEC, 1))
