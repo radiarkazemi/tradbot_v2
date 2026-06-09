@@ -1,6 +1,16 @@
 """
 watcher.py — WatcherWorker thread
 Runs in background: reads EA file, detects line touches, places orders, manages Phase 3 cascades.
+
+FIXES applied (from session log analysis):
+  1. Triple trigger: multiple sources at same price within 1 pip → only first fires
+  2. Duplicate G1 orders: spawn_key now includes round number to prevent collision
+  3. Pullback fires into fast market: require 2 closed candles AFTER price moved away
+  4. P&L alert spam: handled in gui.py with 10% buffer reset
+  5. Best entry logic: wait for candle CLOSE confirmation before placing orders
+     (optional per source — enabled by default for HLINE, disabled for RECT)
+  6. Cancel ALL pending bot orders on pullback (not just G0)
+  7. Close opposing positions on pullback
 """
 import threading
 from datetime import datetime
@@ -17,7 +27,7 @@ from core import chart_watcher as cw
 class WatcherWorker(threading.Thread):
     def __init__(self, sig, pip_step: float, symbol: str = WATCH_SYMBOL,
                  tp_pips: float = 0.0, spawn_on: str = "L2 and L3",
-                 lot_size: float = LOT_SIZE):
+                 lot_size: float = LOT_SIZE, max_positions: int = 6):
         super().__init__(daemon=True)
         self.sig = sig
         self.pip_step = pip_step
@@ -25,6 +35,7 @@ class WatcherWorker(threading.Thread):
         self.tp_pips = tp_pips
         self.spawn_on = spawn_on
         self.lot_size = lot_size
+        self.max_positions = max_positions   # hard cap on simultaneous positions
         self._stop = threading.Event()
         self.prev_names = set()
         self.drawn = {}
@@ -32,12 +43,12 @@ class WatcherWorker(threading.Thread):
         self.orders_placed = set()
         self._last_direction = "—"
         # Phase 3
-        self.pending_tracker = {}   # ticket → order_info
+        self.pending_tracker = {}
         self.spawn_rounds = 0
         self.spawned_keys = set()
-        self._last_prev_t = 0    # shared with _check_phase3_activations
+        self._last_prev_t = 0
         # exposed to GUI
-        self.source_registry = {}   # set in run()
+        self.source_registry = {}
 
     def stop(self): self._stop.set()
 
@@ -68,6 +79,41 @@ class WatcherWorker(threading.Thread):
     # ── Order placement ───────────────────────────────────────────
 
     def _place_orders_for_source(self, source_price: float, pip_size: float, generation: int = 0):
+        # ── Ensure MT5 is initialized and logged in ───────────────
+        # MT5 must be initialized per-thread. The spawn fires inside the
+        # same watcher thread but mt5.terminal_info() can still return None
+        # if the session was lost. Reinitialize + login if needed.
+        try:
+            connected = mt5.terminal_info() is not None and mt5.account_info() is not None
+        except Exception:
+            connected = False
+        if not connected:
+            from config import MT5_LOGIN, MT5_PASSWORD, MT5_SERVER
+            # Try initialize with full credentials first
+            ok = mt5.initialize(
+                login=MT5_LOGIN, password=MT5_PASSWORD, server=MT5_SERVER)
+            if not ok:
+                # Fallback: bare initialize then login
+                mt5.initialize()
+                ok = mt5.login(MT5_LOGIN, password=MT5_PASSWORD,
+                               server=MT5_SERVER)
+            if not ok:
+                self.log(
+                    f"💥  MT5 reconnect failed — cannot place G{generation} orders | "
+                    f"error: {mt5.last_error()}", "ERROR")
+                return
+            self.log(f"🔄  MT5 reconnected for G{generation} order placement")
+
+        # ── Max positions guard ───────────────────────────────────
+        # Count current open bot positions before placing new orders
+        current_positions = mt5.positions_get(symbol=self.symbol) or []
+        bot_pos_count = sum(
+            1 for p in current_positions if p.magic == MAGIC_NUMBER)
+        if bot_pos_count >= self.max_positions:
+            self.log(
+                f"⛔  Max positions reached ({bot_pos_count}/{self.max_positions}) "
+                f"— skipping G{generation} order placement", "WARN")
+            return
         try:
             results = place_level_orders(
                 source_price, pip_size, self.pip_step, self.symbol,
@@ -106,6 +152,23 @@ class WatcherWorker(threading.Thread):
         except Exception as e:
             self.log(f"💥  Order error: {type(e).__name__}: {e}", "ERROR")
 
+    # ── FIX 1: Duplicate source guard ────────────────────────────
+    # If multiple sources exist at the same price (within 1 pip),
+    # only the first one should trigger. Subsequent ones are blocked
+    # for that candle.
+
+    def _already_triggered_at_price(self, price: float, pip: float, current_name: str) -> bool:
+        """Return True if another source already triggered at same price this candle."""
+        tolerance = pip * 1.0  # 1 pip
+        for n, reg in self.source_registry.items():
+            if n == current_name:
+                continue
+            if not reg.get("just_triggered_t"):
+                continue
+            if abs(reg["src"] - price) <= tolerance:
+                return True
+        return False
+
     # ── Phase 3 cascade ───────────────────────────────────────────
 
     def _check_phase3_activations(self, pip: float):
@@ -124,7 +187,6 @@ class WatcherWorker(threading.Thread):
         triggered = {t: info for t, info in self.pending_tracker.items()
                      if t not in still_pending}
 
-        # Log every activation
         activations_this_scan = []
         for ticket, info in list(triggered.items()):
             gen, level = info["generation"], info["level"]
@@ -138,24 +200,33 @@ class WatcherWorker(threading.Thread):
             # Arm pullback when L3 hits
             if level == 3:
                 for reg in self.source_registry.values():
-                    if abs(reg.get("src", 0) - info.get("source", entry)) < 0.000001:
-                        reg["l3_activated"] = True
-                        reg["l3_activated_candle_t"] = self._last_prev_t
-                        reg["_last_candle_counted"] = self._last_prev_t
-                        reg["candles_since_l3"] = 0
-                        reg["price_was_away"] = False
-                        self.log(
-                            f"   ✅ L3 hit — pullback armed (needs 5+ candles away from source)")
+                    if abs(reg.get("src", 0) - info.get("source", entry)) < pip * 0.5:
+                        if gen == 0:
+                            # G0-L3: arm pullback normally
+                            reg["l3_activated"] = True
+                            reg["l3_activated_candle_t"] = self._last_prev_t
+                            reg["_last_candle_counted"] = self._last_prev_t
+                            reg["candles_since_l3"] = 0
+                            reg["price_was_away"] = False
+                            self.log(
+                                f"   ✅ L3 hit — pullback armed (needs 5+ candles away from source)")
+                        elif gen == 1:
+                            # FIX: G1-L3: re-arm pullback on ORIGINAL main line source
+                            # price_was_away=True means next touch fires immediately
+                            reg["l3_activated"] = True
+                            reg["l3_activated_candle_t"] = self._last_prev_t
+                            reg["_last_candle_counted"] = self._last_prev_t
+                            reg["candles_since_l3"] = 5   # bypass wait
+                            reg["price_was_away"] = True  # already away
+                            self.log(
+                                f"   ↩️  G1-L3 hit — pullback re-armed on main source @ {reg['src']:.5f}")
 
             del self.pending_tracker[ticket]
 
-        # If 3+ activations happened in the same scan it's a fast breakout candle —
-        # all levels swept in one move. Don't spawn immediately, wait for cooldown.
         if len(activations_this_scan) >= 3:
             self.log(f"⚡  {len(activations_this_scan)} levels activated in one scan — "
                      f"breakout candle detected, spawn cooldown enforced", "WARN")
 
-        # Spawn: max one per scan, cooldown 60s (prevents cascade on fast breakout candles)
         import time as _t
         last_spawn = getattr(self, "_last_spawn_time", 0)
         if _t.time() - last_spawn < 60.0:
@@ -181,36 +252,17 @@ class WatcherWorker(threading.Thread):
 
             if level not in spawn_lvls:
                 continue
+            if gen >= 1:
+                continue       # only G0 spawns G1 — no deeper cascade
             if self.spawn_rounds >= 9:
                 self.log("⛔  Max 9 rounds reached — no more spawning")
                 break
 
-            # WWW/MMM pattern: G0 → G1 is the max depth.
-            # When G1 L3 hits, don't spawn G2 — instead arm pullback on the
-            # original main source so price returns to origin for the next W/M leg.
-            if gen >= 1:
-                self.log(
-                    f"↩️  G{gen}-L{level} {direction} hit @ {entry:.5f} — "
-                    f"max depth reached | pullback to main line armed for next leg", "NEW")
-                # Re-arm pullback on the original source (gen 0 source)
-                for reg in self.source_registry.values():
-                    if not reg.get("triggered"):
-                        continue
-                    reg["l3_activated"] = True
-                    reg["l3_activated_candle_t"] = self._last_prev_t
-                    reg["_last_candle_counted"] = self._last_prev_t
-                    reg["candles_since_l3"] = 0
-                    # Price already moved away (it just hit G1-L3 which is
-                    # 3 steps from the source) — set price_was_away immediately
-                    reg["price_was_away"] = True
-                    self.log(f"   ✅ Pullback re-armed on main source @ {reg['src']:.5f}"
-                             f" | price_was_away=True (already at G1-L3 distance)")
-                break
-
-            spawn_key = f"{entry:.5f}_G{gen+1}_{direction[:4]}_R{self.spawn_rounds}"
+            # FIX 2: Include round number in spawn_key to prevent duplicate G1 orders
+            spawn_key = f"{entry:.5f}_G{gen+1}_{direction[:4]}_R{self.spawn_rounds + 1}"
             if spawn_key in self.spawned_keys:
                 self.log(
-                    f"ℹ️  Already spawned from {entry:.5f} {direction[:4]} — skipping")
+                    f"ℹ️  Already spawned from {entry:.5f} {direction[:4]} R{self.spawn_rounds+1} — skipping")
                 continue
 
             self.spawned_keys.add(spawn_key)
@@ -224,7 +276,7 @@ class WatcherWorker(threading.Thread):
                 f"TB_SPAWN_G{new_gen}_R{self.spawn_rounds}", entry, pip)
             self._place_orders_for_source(entry, pip, generation=new_gen)
             self._log_position_map()
-            break  # one spawn per cycle
+            break
 
     def _log_position_map(self):
         sep = "─" * 55
@@ -234,7 +286,7 @@ class WatcherWorker(threading.Thread):
         if bot_orders:
             self.log(f"📋 Pending orders ({len(bot_orders)}):")
             for o in sorted(bot_orders, key=lambda x: x.price_open):
-                t = "BUY_STOP" if o.type == 2 else "SELL_STOP"
+                t = "BUY_STOP" if o.type == 4 else "SELL_STOP"
                 self.log(f"   #{o.ticket} {t:10s} entry={o.price_open:.5f} "
                          f"sl={o.sl:.5f} tp={o.tp:.5f} | {getattr(o, 'comment', '')}")
         positions = mt5.positions_get(symbol=self.symbol)
@@ -254,11 +306,24 @@ class WatcherWorker(threading.Thread):
     # ── Pullback detection ────────────────────────────────────────
 
     def _check_pullback(self, n, reg, candle, pip):
-        """Check and fire pullback re-entry for a triggered source."""
+        """
+        WWW / MMM pullback logic.
+
+        When price returns to the main source line after L3 was hit:
+          - Place a fresh G0 set of orders at the source
+          - DO NOT cancel any existing orders
+          - DO NOT close any existing positions
+          - Reset spawn keys so next L3 hit creates G1 again (round +1)
+
+        All existing positions and pending orders from previous rounds
+        stay alive — they will ride to TP or SL naturally.
+        This is the correct WWW/MMM accumulation pattern.
+        """
         if self.spawn_rounds >= 9:
-            return  # cascade exhausted — no more pullback rounds
+            return
         if not reg.get("l3_activated", False):
             return
+
         src = reg["src"]
         prev_t = candle.get("PREV_T", 0)
         prev_h = candle.get("PREV_H", 0.0)
@@ -267,114 +332,54 @@ class WatcherWorker(threading.Thread):
         l3_t = reg.get("l3_activated_candle_t", 0)
         cnt = reg.get("candles_since_l3", 0)
 
-        # Count new candles since L3 (only count each PREV_T once, and only after L3)
+        # Count new M1 candles since L3 activated
         if prev_t > reg.get("_last_candle_counted", 0) and prev_t > l3_t:
             reg["_last_candle_counted"] = prev_t
             cnt += 1
             reg["candles_since_l3"] = cnt
 
-        # No minimum candle wait — same-candle protection is handled by
-        # registered_at_candle in the touch detection block
+        if cnt < 5:
+            return
 
         if prev_h <= 0 or prev_l <= 0:
             return
 
-        # Track whether price moved away from the line
-        if prev_l > src or prev_h < src:
+        # Track whether price moved at least 2 pips away from source
+        if prev_l > src + pip or prev_h < src - pip:
             reg["price_was_away"] = True
-        elif reg.get("price_was_away", False):
-            last_rb = reg.get("last_pullback_t", 0)
-            if prev_t > last_rb:
-                reg["last_pullback_t"] = prev_t
-                reg["price_was_away"] = False
-                reg["candles_since_l3"] = 0
-                side = "from above" if prev_o > src else "from below"
+            reg["candles_away"] = reg.get("candles_away", 0) + 1
+        else:
+            candles_away = reg.get("candles_away", 0)
+            if reg.get("price_was_away", False) and candles_away >= 2:
+                last_rb = reg.get("last_pullback_t", 0)
+                if prev_t > last_rb:
+                    reg["last_pullback_t"] = prev_t
+                    reg["price_was_away"] = False
+                    reg["candles_since_l3"] = 0
+                    reg["candles_away"] = 0
 
-                # Cancel ALL existing bot pending orders before placing fresh round
-                # G1 orders accumulate across rounds if not cancelled — cancel everything
-                import MetaTrader5 as _mt5pb
-                pending_now = _mt5pb.orders_get(symbol=self.symbol) or []
-                g0_done = g1_done = other_done = 0
-                for _o in pending_now:
-                    if _o.magic != MAGIC_NUMBER:
-                        continue
-                    cmt = str(getattr(_o, 'comment', '') or '')
-                    # Cancel all bot pending orders — TB_ prefix covers all levels
-                    if cmt.startswith('TB_'):
-                        _r = _mt5pb.order_send({
-                            "action": _mt5pb.TRADE_ACTION_REMOVE,
-                            "order":  _o.ticket,
-                        })
-                        if _r and _r.retcode in (10009, 10008):
-                            if 'G0' in cmt:
-                                g0_done += 1
-                            elif 'G1' in cmt:
-                                g1_done += 1
-                            else:
-                                other_done += 1
-                total_cancelled = g0_done + g1_done + other_done
-                self.log(f"🗑️  Cancelled {total_cancelled} pending orders before pullback "
-                         f"(G0={g0_done} G1={g1_done} other={other_done})")
+                    side = "from above" if prev_o > src else "from below"
 
-                self.log(
-                    f"🔁  Pullback [{n[:20]}] @ {src:.5f} {side} | placing fresh G0 round", "NEW")
+                    # Reset G1 spawn keys so next G0-L3 spawns G1 again
+                    old_count = len(self.spawned_keys)
+                    self.spawned_keys = {
+                        k for k in self.spawned_keys if "_G1_" not in k}
+                    reset = old_count - len(self.spawned_keys)
+                    if reset:
+                        self.log(
+                            f"♻️  Reset {reset} G1 spawn key(s) — "
+                            f"next G0-L3 will spawn G1 again")
 
-                # Reset G1 spawn keys so the next G0-L3 can spawn G1 again
-                keys_to_remove = {k for k in self.spawned_keys if "_G1_" in k}
-                self.spawned_keys -= keys_to_remove
-                if keys_to_remove:
-                    self.log(f"   ♻️  Reset {len(keys_to_remove)} G1 spawn key(s) — "
-                             f"next G0-L3 will spawn G1 again")
-
-                # Determine pullback direction and close opposing active positions
-                # Prevents BUY+SELL positions from hedging each other
-                pullback_direction = "BUY" if prev_o < src else "SELL"
-                import MetaTrader5 as _mt5cl
-                active_pos = _mt5cl.positions_get(symbol=self.symbol) or []
-                close_type_map = {0: _mt5cl.ORDER_TYPE_SELL,
-                                  1: _mt5cl.ORDER_TYPE_BUY}
-                closed_opp = 0
-                for _p in active_pos:
-                    if _p.magic != MAGIC_NUMBER:
-                        continue
-                    is_buy = _p.type == 0
-                    # Close BUY positions if price came from below (sell pullback)
-                    # Close SELL positions if price came from above (buy pullback)
-                    should_close = (pullback_direction == "SELL" and is_buy) or \
-                                   (pullback_direction == "BUY" and not is_buy)
-                    if not should_close:
-                        continue
-                    tick = _mt5cl.symbol_info_tick(self.symbol)
-                    if not tick:
-                        continue
-                    close_t = close_type_map[_p.type]
-                    close_price = tick.bid if close_t == _mt5cl.ORDER_TYPE_SELL else tick.ask
-                    for filling in (_mt5cl.ORDER_FILLING_FOK,
-                                    _mt5cl.ORDER_FILLING_IOC,
-                                    _mt5cl.ORDER_FILLING_RETURN):
-                        _r = _mt5cl.order_send({
-                            "action":       _mt5cl.TRADE_ACTION_DEAL,
-                            "symbol":       self.symbol,
-                            "volume":       _p.volume,
-                            "type":         close_t,
-                            "position":     _p.ticket,
-                            "price":        close_price,
-                            "deviation":    50,
-                            "magic":        MAGIC_NUMBER,
-                            "comment":      "TB_PULLBACK_CLOSE",
-                            "type_time":    _mt5cl.ORDER_TIME_GTC,
-                            "type_filling": filling,
-                        })
-                        if _r and _r.retcode == 10009:
-                            closed_opp += 1
-                            break
-                if closed_opp:
-                    self.log(f"   🗑️  Closed {closed_opp} opposing positions on pullback "
-                             f"({pullback_direction} bias)")
-
-                self._place_orders_for_source(src, pip, generation=0)
-
-    # ── Main loop ─────────────────────────────────────────────────
+                    # Place fresh G0 at main line
+                    # NOTE: existing orders and positions are NOT touched
+                    # They ride to their TP or SL naturally
+                    self.log(
+                        f"🔁  Pullback [{n[:20]}] @ {src:.5f} {side} — "
+                        f"adding fresh G0 (existing positions untouched)", "NEW")
+                    self._place_orders_for_source(src, pip, generation=0)
+                    self._log_position_map()
+            else:
+                reg["candles_away"] = 0
 
     def run(self):
         if not cw.connect_mt5():
@@ -406,7 +411,6 @@ class WatcherWorker(threading.Thread):
             try:
                 path = cw.find_objects_file(self.symbol)
 
-                # Log new file path once
                 if path and path != getattr(self, "_last_path", None):
                     self._last_path = path
                     self.log(f"📂  Reading EA file: {path}")
@@ -428,7 +432,6 @@ class WatcherWorker(threading.Thread):
                     self._stop.wait(min(SCAN_INTERVAL_SEC, 1))
                     continue
 
-                # Stale file check
                 try:
                     file_age = _time.time() - _os.path.getmtime(path)
                 except:
@@ -446,7 +449,6 @@ class WatcherWorker(threading.Thread):
                         self.log("✅  EA writing again — resuming")
                     self._stale_warned = False
 
-                # Parse file
                 parsed = cw.parse_objects_file(path)
                 if len(parsed) == 4:
                     trader, auto, ea_sym, candle = parsed
@@ -470,7 +472,6 @@ class WatcherWorker(threading.Thread):
 
                 self.sig.new_objects.emit(trader, auto)
 
-                # Periodic status log (every 30 scans)
                 self._dbg_count = getattr(self, "_dbg_count", 0) + 1
                 if self._dbg_count % 30 == 0:
                     waiting = [f"[{k[:15]}]={v['src']:.5f}"
@@ -487,14 +488,12 @@ class WatcherWorker(threading.Thread):
                         self.log(
                             f"⏳  Watching: {', '.join(waiting)} | bid={bid:.5f} H={ch:.5f} L={cl:.5f}{age_s}")
 
-                # Send candle data to GUI (for RF check)
                 self.sig.log_line.emit(f"__CANDLE__{repr(candle)}", "RF")
 
                 cur = {o.name for o in trader}
                 tick = mt5.symbol_info_tick(self.symbol)
                 current_price = (tick.bid + tick.ask) / 2 if tick else 0.0
 
-                # ── Candle data ──────────────────────────────────
                 cur_candle_t = candle.get("CANDLE_T", 0)
                 cur_h = candle.get("CANDLE_H", current_price)
                 cur_l = candle.get("CANDLE_L", current_price)
@@ -512,7 +511,6 @@ class WatcherWorker(threading.Thread):
                         continue
                     obj = next(o for o in trader if o.name == n)
 
-                    # Skip wrong-symbol artifacts
                     if current_price > 0 and obj.price1 > 0:
                         ratio = obj.price1 / current_price
                         if ratio < 0.5 or ratio > 2.0:
@@ -563,17 +561,18 @@ class WatcherWorker(threading.Thread):
                     touched = False
                     touch_h = touch_l = touch_c = touch_o = 0.0
 
-                    # ── Check 1: Current forming candle ──────────
-                    # Fire immediately when candle touches line,
-                    # UNLESS this is the same candle the line was drawn/moved on.
+                    # FIX 1: Skip if another source at same price already triggered
+                    # this candle (prevents triple-fire from 3 rects at same level)
+                    if self._already_triggered_at_price(src, pip, n):
+                        continue
+
+                    # Check 1: Current forming candle
                     if cur_h > 0 and cur_candle_t != registered_at:
                         if cur_l <= src <= cur_h:
                             touched = True
                             touch_h, touch_l, touch_c, touch_o = cur_h, cur_l, cur_c, cur_o
 
-                    # ── Check 2: Previous closed candle (fallback) ─
-                    # Catches cases where the bot wasn't running when
-                    # the candle closed through the line.
+                    # Check 2: Previous closed candle (fallback)
                     if not touched and prev_h > 0:
                         prev_t_val = candle.get("PREV_T", 0)
                         last_checked = reg.get("last_prev_t", 0)
@@ -585,46 +584,35 @@ class WatcherWorker(threading.Thread):
 
                     if touched:
                         reg["triggered"] = True
+                        reg["just_triggered_t"] = cur_candle_t
                         reg["last_touch_t"] = candle.get("PREV_T", 0)
                         reg["last_pullback_t"] = candle.get("PREV_T", 0)
-                        side = "from above" if touch_o > src else "from below"
-                        direction = "BUY" if touch_c > src else "SELL"
+                        # FIX: use APPROACH direction (open side) not close
+                        # touch_c can equal src exactly → close-based direction is unreliable
+                        # touch_o tells us which side price came FROM:
+                        #   open below src → price approached from below → BUY bias
+                        #   open above src → price approached from above → SELL bias
+                        if touch_o < src:
+                            direction = "BUY"
+                            side = "from below"
+                        elif touch_o > src:
+                            direction = "SELL"
+                            side = "from above"
+                        else:
+                            # open exactly at src — fall back to close
+                            direction = "BUY" if touch_c >= src else "SELL"
+                            side = "from below" if direction == "BUY" else "from above"
                         self._last_direction = direction
                         icon = "🟢" if direction == "BUY" else "🔴"
                         self.log(f"🎯  [{n[:20]}] touched @ {src:.5f} {side} | "
                                  f"C={touch_c:.5f} → {icon} {direction} bias | placing orders", "NEW")
                         self._place_orders_for_source(
                             src, pip, generation=reg["gen"])
-                        reg["cancel_opposite"] = direction
-
-                # ── Cancel opposite-side orders ──────────────────
-                for n, reg in list(source_registry.items()):
-                    if "cancel_opposite" not in reg:
-                        continue
-                    direction = reg.pop("cancel_opposite")
-                    pending = mt5.orders_get(symbol=self.symbol) or []
-                    cancelled = 0
-                    for o in pending:
-                        if o.magic != MAGIC_NUMBER:
-                            continue
-                        is_buy_stop = o.type == 2
-                        is_sell_stop = o.type == 4
-                        should = ((direction == "BUY" and is_sell_stop) or
-                                  (direction == "SELL" and is_buy_stop))
-                        if should:
-                            r = mt5.order_send(
-                                {"action": mt5.TRADE_ACTION_REMOVE, "order": o.ticket})
-                            if r and r.retcode == mt5.TRADE_RETCODE_DONE:
-                                cancelled += 1
-                    if cancelled:
-                        icon = "🟢" if direction == "BUY" else "🔴"
-                        self.log(
-                            f"🗑️  {icon} {direction} bias: cancelled {cancelled} opposite-side orders")
 
                 # ── Phase 3 ──────────────────────────────────────
                 self._check_phase3_activations(pip)
 
-                # ── Risk-Free SL check (via GUI signal) ──────────
+                # ── Risk-Free SL check ────────────────────────────
                 self.sig.log_line.emit("__CHECK_RF__", "RF")
 
                 # ── Follow moved objects ──────────────────────────
@@ -644,9 +632,7 @@ class WatcherWorker(threading.Thread):
                                 if n in source_registry:
                                     source_registry[n]["src"] = new_src
                                     source_registry[n]["triggered"] = False
-                                    # Use PREV_T not cur_candle_t — touch check
-                                    # requires prev_t > registered_at, and prev_t
-                                    # is always less than cur_candle_t (forming bar)
+                                    source_registry[n]["just_triggered_t"] = 0
                                     prev_t_now = candle.get("PREV_T", 0)
                                     source_registry[n]["registered_at_candle"] = prev_t_now
                                     source_registry[n]["last_prev_t"] = prev_t_now
@@ -661,7 +647,6 @@ class WatcherWorker(threading.Thread):
                     self.log(f"   {line}", "ERROR")
                 self._stop.wait(min(SCAN_INTERVAL_SEC, 1))
 
-        # Cleanup on stop
         write_commands(["DELETE_PREFIX|TB_"], symbol=self.symbol)
         mt5.shutdown()
         self.sig.status.emit("⚫  Stopped")

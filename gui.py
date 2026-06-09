@@ -284,6 +284,20 @@ class GUI(QMainWindow):
         self.spin_lot.setDecimals(2)
         _row("📦 Lot size:", self.spin_lot, "Lot size per order")
 
+        # Max simultaneous positions
+        self.spin_max_pos = QSpinBox()
+        self.spin_max_pos.setRange(1, 50)
+        self.spin_max_pos.setValue(6)
+        self.spin_max_pos.setToolTip(
+            "Hard cap on total simultaneous open positions.\n"
+            "No new orders will be placed once this number is reached.\n"
+            "Default 6 = one full G0 round (3 BUY + 3 SELL).\n"
+            "Set to 12 to allow G0 + G1 simultaneously.\n"
+            "The bot also closes any 'stray' positions (wrong direction)\n"
+            "that sneak through the bias filter in fast markets.")
+        _row("🔢 Max positions:", self.spin_max_pos,
+             "Max simultaneous open positions (stray guard)")
+
         # Spawn level
         self.combo_spawn = QComboBox()
         self.combo_spawn.addItems(["L2 only", "L3 only", "L2 and L3"])
@@ -754,6 +768,71 @@ class GUI(QMainWindow):
         rf_layout.addWidget(self.lbl_rf_status)
 
         ol.addWidget(grp_rf)
+
+        # ── T Feature — Set TP for one side ──────────────────────
+        grp_tp = QGroupBox("🎯 Set TP (one side)")
+        grp_tp.setStyleSheet(
+            f"QGroupBox{{color:{C['cyan']};font-size:10px;font-weight:bold;"
+            f"border:1px solid {C['border_hi']};border-radius:5px;margin-top:6px;}}"
+            f"QGroupBox::title{{subcontrol-origin:margin;left:8px;padding:0 4px;}}")
+        tp_layout = QVBoxLayout(grp_tp)
+        tp_layout.setSpacing(5)
+        tp_layout.setContentsMargins(8, 10, 8, 8)
+
+        # Info label
+        lbl_tp_info = QLabel(
+            "Sets TP on all positions of the chosen type.\n"
+            "Does NOT touch pending orders or the other side.")
+        lbl_tp_info.setStyleSheet(f"color:{C['txt3']};font-size:9px;")
+        lbl_tp_info.setWordWrap(True)
+        tp_layout.addWidget(lbl_tp_info)
+
+        # Side selector + TP price on same row
+        tp_row1 = QHBoxLayout()
+        tp_row1.setSpacing(6)
+        lbl_tp_side = QLabel("Apply to:")
+        lbl_tp_side.setStyleSheet(f"color:{C['txt2']};font-size:10px;")
+        tp_row1.addWidget(lbl_tp_side)
+        self.combo_tp_side = QComboBox()
+        self.combo_tp_side.addItems(["BUY positions", "SELL positions"])
+        self.combo_tp_side.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Fixed)
+        tp_row1.addWidget(self.combo_tp_side)
+        tp_layout.addLayout(tp_row1)
+
+        tp_row2 = QHBoxLayout()
+        tp_row2.setSpacing(6)
+        lbl_tp_price = QLabel("TP price:")
+        lbl_tp_price.setStyleSheet(f"color:{C['txt2']};font-size:10px;")
+        tp_row2.addWidget(lbl_tp_price)
+        self.edit_tp_price = QLineEdit()
+        self.edit_tp_price.setPlaceholderText("e.g. 1.16800")
+        self.edit_tp_price.setMinimumWidth(80)
+        self.edit_tp_price.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.edit_tp_price.setToolTip(
+            "Enter the TP price to set on all BUY or SELL positions.\n"
+            "Only that side is touched — pending orders and other\n"
+            "direction positions are completely unaffected.")
+        tp_row2.addWidget(self.edit_tp_price)
+        tp_layout.addLayout(tp_row2)
+
+        self.btn_tp_apply = QPushButton("🎯  Apply TP")
+        self.btn_tp_apply.setMinimumHeight(30)
+        self.btn_tp_apply.setStyleSheet(
+            f"background:{C['cyan']};color:black;font-weight:bold;"
+            f"border-radius:4px;font-size:10px;")
+        self.btn_tp_apply.setToolTip(
+            "Sets the TP price on all BUY (or SELL) positions.\n"
+            "Nothing else is touched.")
+        self.btn_tp_apply.clicked.connect(self._apply_tp)
+        tp_layout.addWidget(self.btn_tp_apply)
+
+        self.lbl_tp_status = QLabel("")
+        self.lbl_tp_status.setStyleSheet(f"color:{C['txt3']};font-size:9px;")
+        tp_layout.addWidget(self.lbl_tp_status)
+
+        ol.addWidget(grp_tp)
         vl.addWidget(grp2)
 
         # ── Levels table ─────────────────────────────────────────
@@ -1233,9 +1312,11 @@ class GUI(QMainWindow):
         self._tp_pips = self.spin_tp.value()
         self._spawn_lvls = self.combo_spawn.currentText()
         self._lot_size = self.spin_lot.value()
+        self._max_pos = self.spin_max_pos.value()
         self._worker = WatcherWorker(self._sig, self._pip_step, symbol=active_sym,
                                      tp_pips=self._tp_pips, spawn_on=self._spawn_lvls,
-                                     lot_size=self._lot_size)
+                                     lot_size=self._lot_size,
+                                     max_positions=self._max_pos)
         self._worker.follow_enabled = self.chk_follow.isChecked()
         self._worker.start()
         self.btn_start.setEnabled(False)
@@ -1552,8 +1633,11 @@ class GUI(QMainWindow):
         1. Determine which side to KEEP (BUY or SELL)
         2. Close all positions on the OPPOSITE side
         3. Cancel ALL pending orders
-        4. Draw a horizontal line on chart labeled "TB_RF_SL"
-        5. Every scan cycle: if price touches that line → close all kept positions
+        4. SET ACTUAL MT5 SL on each kept position via TRADE_ACTION_SLTP
+           → MT5 broker engine handles close when price hits SL
+           → This is the reliable path — no bot watching required
+        5. Draw visual line on chart for reference
+        6. Keep candle watcher as backup in case broker SL fails
         """
         import MetaTrader5 as _mt5
         sym = self.sym_combo.currentText().strip() or WATCH_SYMBOL
@@ -1573,68 +1657,109 @@ class GUI(QMainWindow):
                 f"{datetime.now().strftime('%H:%M:%S')}  ⚠️  No {keep_side} positions to protect", "WARN")
             return
 
-        # Close opposite side
+        # ── Step 1: Close opposite side ──────────────────────────
         closed = 0
         for p in close_pos:
             close_type = _mt5.ORDER_TYPE_SELL if p.type == 0 else _mt5.ORDER_TYPE_BUY
             tick = _mt5.symbol_info_tick(sym)
             price = tick.bid if close_type == _mt5.ORDER_TYPE_SELL else tick.ask
-            req = {
-                "action":       _mt5.TRADE_ACTION_DEAL,
-                "symbol":       sym,
-                "volume":       p.volume,
-                "type":         close_type,
-                "position":     p.ticket,
-                "price":        price,
-                "deviation":    20,
-                "magic":        MAGIC_NUMBER,
-                "comment":      "TB_RF_CLOSE",
-                "type_time":    _mt5.ORDER_TIME_GTC,
-                "type_filling": _mt5.ORDER_FILLING_RETURN,
-            }
-            res = _mt5.order_send(req)
-            if res and res.retcode == _mt5.TRADE_RETCODE_DONE:
-                closed += 1
+            for filling in (_mt5.ORDER_FILLING_FOK, _mt5.ORDER_FILLING_IOC,
+                            _mt5.ORDER_FILLING_RETURN):
+                req = {
+                    "action":       _mt5.TRADE_ACTION_DEAL,
+                    "symbol":       sym,
+                    "volume":       p.volume,
+                    "type":         close_type,
+                    "position":     p.ticket,
+                    "price":        price,
+                    "deviation":    20,
+                    "magic":        MAGIC_NUMBER,
+                    "comment":      "TB_RF_CLOSE",
+                    "type_time":    _mt5.ORDER_TIME_GTC,
+                    "type_filling": filling,
+                }
+                res = _mt5.order_send(req)
+                if res and res.retcode == _mt5.TRADE_RETCODE_DONE:
+                    closed += 1
+                    break
 
-        # Cancel all pending
+        # ── Step 2: Cancel all pending orders ────────────────────
         pending = _mt5.orders_get(symbol=sym) or []
         cancelled = 0
         for o in pending:
             if o.magic == MAGIC_NUMBER:
-                res = _mt5.order_send(
-                    {"action": _mt5.TRADE_ACTION_REMOVE, "order": o.ticket})
+                res = _mt5.order_send({
+                    "action": _mt5.TRADE_ACTION_REMOVE,
+                    "order":  o.ticket})
                 if res and res.retcode == _mt5.TRADE_RETCODE_DONE:
                     cancelled += 1
 
-        # Use user-specified exit price or fall back to average entry
+        # ── Step 3: Determine RF SL price ────────────────────────
         try:
             rf_price_text = self.edit_rf_price.text().strip()
             sl_price = float(rf_price_text) if rf_price_text else 0.0
         except ValueError:
             sl_price = 0.0
         if sl_price <= 0:
+            # Fall back to average entry of kept positions
             sl_price = round(
                 sum(p.price_open for p in keep_pos) / len(keep_pos), 5)
             self.edit_rf_price.setText(f"{sl_price:.5f}")
-        write_commands(
-            [f"DRAW_HLINE|TB_RF_SL|{sl_price:.5f}|{0xFFD700}|2|0"], symbol=sym)
-        avg_entry = sl_price
 
-        # Store RF state for watcher to monitor
+        # ── Step 4: SET ACTUAL MT5 SL ON EACH KEPT POSITION ─────
+        # This is the KEY fix. TRADE_ACTION_SLTP sets the SL directly
+        # on the MT5 server. When price hits it, MT5 closes the position
+        # automatically — no bot watching needed, no missed candles.
+        sl_set = 0
+        sl_failed = 0
+        sym_info = _mt5.symbol_info(sym)
+        for p in keep_pos:
+            # Keep existing TP if set, only change SL
+            current_tp = p.tp  # 0.0 if no TP set
+
+            req = {
+                "action":   _mt5.TRADE_ACTION_SLTP,
+                "symbol":   sym,
+                "position": p.ticket,
+                "sl":       sl_price,
+                "tp":       current_tp,
+            }
+            res = _mt5.order_send(req)
+            if res and res.retcode == _mt5.TRADE_RETCODE_DONE:
+                sl_set += 1
+            else:
+                sl_failed += 1
+                err = res.retcode if res else "no response"
+                self._on_log(
+                    f"{datetime.now().strftime('%H:%M:%S')}  ⚠️  "
+                    f"SL set failed #{p.ticket}: retcode={err}", "WARN")
+
+        # ── Step 5: Draw visual line for reference ────────────────
+        write_commands(
+            [f"DRAW_HLINE|TB_RF_SL|{sl_price:.5f}|{0xFFD700}|2|0"],
+            symbol=sym)
+
+        # ── Step 6: Store RF state (candle watcher as backup) ────
         self._rf_active = True
         self._rf_keep_side = keep_side
         self._rf_sym = sym
-        self._rf_price = sl_price   # stored price — not from EA objects
+        self._rf_price = sl_price
         self._rf_tickets = [p.ticket for p in keep_pos]
 
-        n_keep = len(keep_pos)
         ts = datetime.now().strftime("%H:%M:%S")
+        status = "✅" if sl_failed == 0 else "⚠️"
         self._on_log(
-            f"{ts}  🛡️  Risk-Free ACTIVE — keeping {n_keep} {keep_side} positions | "
+            f"{ts}  🛡️  Risk-Free ACTIVE — keeping {len(keep_pos)} {keep_side} | "
             f"closed {closed} {close_side} | cancelled {cancelled} pending | "
-            f"Gold SL line drawn @ {avg_entry:.5f} — DRAG IT in MT5 to set exit price", "NEW")
+            f"SL set on MT5: {sl_set}/{len(keep_pos)} positions @ {sl_price:.5f} "
+            f"{status}", "NEW")
+        if sl_failed > 0:
+            self._on_log(
+                f"{ts}  ⚠️  {sl_failed} SL(s) failed to set — bot watcher active as fallback",
+                "WARN")
+
         self.lbl_rf_status.setText(
-            f"🛡️ Active: {n_keep} {keep_side} | exit @ {avg_entry:.5f}")
+            f"🛡️ Active: {len(keep_pos)} {keep_side} | MT5 SL @ {sl_price:.5f}")
         self.lbl_rf_status.setStyleSheet(
             f"color:{C['gold']};font-size:10px;font-weight:bold;")
         self.btn_rf_update.setEnabled(True)
@@ -1642,26 +1767,171 @@ class GUI(QMainWindow):
         self.btn_rf.setEnabled(False)
 
     def _update_rf_sl(self):
-        """Update the RF SL exit price from the input field."""
+        """Update the RF SL — both the visual line AND the actual MT5 SL on each position."""
         if not getattr(self, "_rf_active", False):
             return
         try:
             new_price = float(self.edit_rf_price.text().strip())
         except ValueError:
             self._on_log(
-                f"{datetime.now().strftime('%H:%M:%S')}  ⚠️  Invalid price — enter a number like 1.16420", "WARN")
+                f"{datetime.now().strftime('%H:%M:%S')}  ⚠️  Invalid price", "WARN")
             return
+
+        import MetaTrader5 as _mt5
         sym = self._rf_sym
+
+        # Update visual line
         write_commands(
-            [f"DRAW_HLINE|TB_RF_SL|{new_price:.5f}|{0xFFD700}|2|0"], symbol=sym)
-        self._rf_price = new_price  # update stored price
+            [f"DRAW_HLINE|TB_RF_SL|{new_price:.5f}|{0xFFD700}|2|0"],
+            symbol=sym)
+        self._rf_price = new_price
+
+        # Update real MT5 SL on ALL kept positions that are still open
+        positions = _mt5.positions_get(symbol=sym) or []
+        updated = 0
+        failed = 0
+        for p in positions:
+            if p.magic != MAGIC_NUMBER:
+                continue
+            is_keep = (p.type == 0) == (self._rf_keep_side == "BUY")
+            if not is_keep:
+                continue
+            req = {
+                "action":   _mt5.TRADE_ACTION_SLTP,
+                "symbol":   sym,
+                "position": p.ticket,
+                "sl":       new_price,
+                "tp":       p.tp,  # keep existing TP
+            }
+            res = _mt5.order_send(req)
+            if res and res.retcode == _mt5.TRADE_RETCODE_DONE:
+                updated += 1
+            else:
+                failed += 1
+
+        ts = datetime.now().strftime("%H:%M:%S")
+        status = "✅" if failed == 0 else f"⚠️ {failed} failed"
         self._on_log(
-            f"{datetime.now().strftime('%H:%M:%S')}  📍  RF exit price updated → {new_price:.5f}", "NEW")
+            f"{ts}  📍  RF SL updated → {new_price:.5f} | "
+            f"MT5 SL set on {updated} positions {status}", "NEW")
         self.lbl_rf_status.setText(
-            f"🛡️ Active: {self._rf_keep_side} | exit @ {new_price:.5f}")
+            f"🛡️ Active: {self._rf_keep_side} | MT5 SL @ {new_price:.5f}")
+
+    def _apply_tp(self):
+        """
+        T Feature — set one TP price on all positions of the selected type.
+        - Only touches BUY or SELL positions (user's choice)
+        - Does NOT cancel pending orders
+        - Does NOT touch positions of the other type
+        - Does NOT touch SL of any position
+        """
+        import MetaTrader5 as _mt5
+        sym = self.sym_combo.currentText().strip() or WATCH_SYMBOL
+
+        # Determine which side to apply TP to
+        side_text = self.combo_tp_side.currentText()
+        apply_to_buy = "BUY" in side_text
+
+        # Parse TP price
+        try:
+            tp_price = float(self.edit_tp_price.text().strip())
+            if tp_price <= 0:
+                raise ValueError("TP must be > 0")
+        except ValueError:
+            self._on_log(
+                f"{datetime.now().strftime('%H:%M:%S')}  ⚠️  Invalid TP price — "
+                f"enter a valid price like 1.16800", "WARN")
+            self.lbl_tp_status.setText("⚠️ Invalid price")
+            self.lbl_tp_status.setStyleSheet(
+                f"color:{C['red']};font-size:9px;")
+            return
+
+        # Get all bot positions of the chosen type
+        positions = _mt5.positions_get(symbol=sym) or []
+        target_pos = [
+            p for p in positions
+            if p.magic == MAGIC_NUMBER
+            and (p.type == 0) == apply_to_buy   # type 0 = BUY, 1 = SELL
+        ]
+
+        if not target_pos:
+            side_name = "BUY" if apply_to_buy else "SELL"
+            self._on_log(
+                f"{datetime.now().strftime('%H:%M:%S')}  ⚠️  No {side_name} positions found", "WARN")
+            self.lbl_tp_status.setText(f"⚠️ No {side_name} positions")
+            self.lbl_tp_status.setStyleSheet(
+                f"color:{C['yellow']};font-size:9px;")
+            return
+
+        # Validate TP direction makes sense
+        # BUY: TP must be above current price
+        # SELL: TP must be below current price
+        tick = _mt5.symbol_info_tick(sym)
+        if tick:
+            current = (tick.bid + tick.ask) / 2
+            if apply_to_buy and tp_price <= current:
+                self._on_log(
+                    f"{datetime.now().strftime('%H:%M:%S')}  ⚠️  BUY TP must be above current price "
+                    f"({current:.5f})", "WARN")
+                self.lbl_tp_status.setText("⚠️ TP below current price")
+                self.lbl_tp_status.setStyleSheet(
+                    f"color:{C['red']};font-size:9px;")
+                return
+            if not apply_to_buy and tp_price >= current:
+                self._on_log(
+                    f"{datetime.now().strftime('%H:%M:%S')}  ⚠️  SELL TP must be below current price "
+                    f"({current:.5f})", "WARN")
+                self.lbl_tp_status.setText("⚠️ TP above current price")
+                self.lbl_tp_status.setStyleSheet(
+                    f"color:{C['red']};font-size:9px;")
+                return
+
+        # Apply TP to each position — keep existing SL, only change TP
+        updated = 0
+        failed = 0
+        side_name = "BUY" if apply_to_buy else "SELL"
+        ts = datetime.now().strftime("%H:%M:%S")
+
+        for p in target_pos:
+            req = {
+                "action":   _mt5.TRADE_ACTION_SLTP,
+                "symbol":   sym,
+                "position": p.ticket,
+                "sl":       p.sl,   # keep existing SL unchanged
+                "tp":       tp_price,
+            }
+            res = _mt5.order_send(req)
+            if res and res.retcode == _mt5.TRADE_RETCODE_DONE:
+                updated += 1
+                self._on_log(
+                    f"{ts}  🎯  #{p.ticket} {side_name} entry={p.price_open:.5f} "
+                    f"→ TP set @ {tp_price:.5f}", "NEW")
+            else:
+                failed += 1
+                err = res.retcode if res else "no response"
+                self._on_log(
+                    f"{ts}  ⚠️  #{p.ticket} TP failed: retcode={err}", "WARN")
+
+        # Status summary
+        if failed == 0:
+            msg = f"✅ TP @ {tp_price:.5f} set on {updated} {side_name} position(s)"
+            self.lbl_tp_status.setText(msg)
+            self.lbl_tp_status.setStyleSheet(
+                f"color:{C['green']};font-size:9px;")
+            self._on_log(f"{ts}  🎯  {msg}", "NEW")
+        else:
+            msg = f"⚠️ {updated} set, {failed} failed"
+            self.lbl_tp_status.setText(msg)
+            self.lbl_tp_status.setStyleSheet(
+                f"color:{C['yellow']};font-size:9px;")
+            self._on_log(f"{ts}  🎯  TP applied: {msg}", "WARN")
 
     def _check_rf_sl(self, candle: dict):
-        """Called each scan cycle when RF mode is active. Closes all kept positions if SL line is touched."""
+        """
+        Backup candle watcher for RF — called each scan cycle.
+        Primary close is handled by MT5 SL set via TRADE_ACTION_SLTP.
+        This fires only if the MT5 SL somehow didn't trigger.
+        """
         if not getattr(self, "_rf_active", False):
             return
         import MetaTrader5 as _mt5
@@ -1671,30 +1941,46 @@ class GUI(QMainWindow):
         cur_h = candle.get("CANDLE_H", 0.0)
         cur_l = candle.get("CANDLE_L", 0.0)
 
-        # Use the stored RF price — either from user input or updated via "Update SL" button
-        # Don't rely on EA objects list (bot-drawn lines aren't in EA export)
         rf_price = getattr(self, "_rf_price", None)
         if rf_price is None:
             return
 
         self.lbl_rf_status.setText(
-            f"🛡️ Active: {self._rf_keep_side} | exit @ {rf_price:.5f}")
+            f"🛡️ Active: {self._rf_keep_side} | MT5 SL @ {rf_price:.5f}")
 
-        # Touch: either previous closed candle or current forming candle crossed RF line
+        # Check if price touched the RF line on either candle
         prev_touched = prev_h > 0 and prev_l <= rf_price <= prev_h
         cur_touched = cur_h > 0 and cur_l <= rf_price <= cur_h
 
         if not (prev_touched or cur_touched):
+            # Also check if all kept positions are already closed
+            # (MT5 SL may have already fired)
+            positions = _mt5.positions_get(symbol=sym) or []
+            kept_open = [
+                p for p in positions
+                if p.magic == MAGIC_NUMBER
+                and (p.type == 0) == (self._rf_keep_side == "BUY")
+            ]
+            if not kept_open:
+                # MT5 SL already closed them — deactivate RF silently
+                self._rf_active = False
+                self._rf_price = None
+                self.lbl_rf_status.setText("✅ RF closed by MT5 SL")
+                self.lbl_rf_status.setStyleSheet(
+                    f"color:{C['cyan']};font-size:10px;")
+                self.btn_rf_update.setEnabled(False)
+                self.btn_rf.setText("🛡️  Activate Risk-Free")
+                self.btn_rf.setEnabled(True)
+                write_commands(["DELETE|TB_RF_SL"], symbol=sym)
             return
 
-        # Close all kept positions at market
+        # Backup close: price touched RF line but MT5 SL didn't fire
         positions = _mt5.positions_get(symbol=sym) or []
         closed = 0
         for p in positions:
             if p.magic != MAGIC_NUMBER:
                 continue
-            is_keep = (p.type == 0) == (self._rf_keep_side == "BUY")
-            if not is_keep:
+            if (p.type == 0) != (self._rf_keep_side == "BUY"):
                 continue
             close_type = _mt5.ORDER_TYPE_SELL if p.type == 0 else _mt5.ORDER_TYPE_BUY
             tick = _mt5.symbol_info_tick(sym)
@@ -1723,9 +2009,8 @@ class GUI(QMainWindow):
 
         ts = datetime.now().strftime("%H:%M:%S")
         self._on_log(
-            f"{ts}  🛡️  RF SL hit @ {rf_price:.5f} | "
-            f"closed {closed}/{len([p for p in positions if p.magic == MAGIC_NUMBER])} "
-            f"{self._rf_keep_side} positions", "NEW")
+            f"{ts}  🛡️  RF backup close @ {rf_price:.5f} | "
+            f"closed {closed} {self._rf_keep_side} positions", "NEW")
         self._rf_active = False
         self._rf_price = None
         self.lbl_rf_status.setText("✅ RF triggered — positions closed")
