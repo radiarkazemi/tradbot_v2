@@ -833,6 +833,63 @@ class GUI(QMainWindow):
         tp_layout.addWidget(self.lbl_tp_status)
 
         ol.addWidget(grp_tp)
+
+        # ── ICT / FVG Panel ───────────────────────────────────────
+        grp_ict = QGroupBox("📐 ICT — Fair Value Gaps")
+        grp_ict.setStyleSheet(
+            f"QGroupBox{{color:{C['cyan']};font-size:10px;font-weight:bold;"
+            f"border:1px solid {C['border_hi']};border-radius:5px;margin-top:6px;}}"
+            f"QGroupBox::title{{subcontrol-origin:margin;left:8px;padding:0 4px;}}")
+        ict_layout = QVBoxLayout(grp_ict)
+        ict_layout.setSpacing(5)
+        ict_layout.setContentsMargins(8, 10, 8, 8)
+
+        # FVG live count label
+        self.lbl_fvg = QLabel("FVG: scanning…")
+        self.lbl_fvg.setStyleSheet(f"color:{C['txt2']};font-size:10px;")
+        self.lbl_fvg.setWordWrap(True)
+        ict_layout.addWidget(self.lbl_fvg)
+
+        # FVG zones list
+        self.lbl_fvg_zones = QLabel("—")
+        self.lbl_fvg_zones.setStyleSheet(
+            f"color:{C['txt3']};font-size:9px;background:{C['card']};"
+            f"border-radius:3px;padding:4px;")
+        self.lbl_fvg_zones.setWordWrap(True)
+        ict_layout.addWidget(self.lbl_fvg_zones)
+
+        # Toggles row
+        ict_row1 = QHBoxLayout()
+        ict_row1.setSpacing(6)
+        self.chk_fvg_tp = QCheckBox("FVG TP")
+        self.chk_fvg_tp.setChecked(True)
+        self.chk_fvg_tp.setToolTip(
+            "Use nearest FVG midpoint as TP target\n"
+            "instead of fixed 50-pip TP")
+        self.chk_fvg_tp.setStyleSheet(f"color:{C['txt2']};font-size:10px;")
+        self.chk_fvg_tp.stateChanged.connect(self._toggle_fvg_tp)
+        ict_row1.addWidget(self.chk_fvg_tp)
+
+        self.chk_partial = QCheckBox("Partial @ G1-L3")
+        self.chk_partial.setChecked(True)
+        self.chk_partial.setToolTip(
+            "When G1-L3 activates: close 50% of profitable\n"
+            "positions and move remaining SLs to breakeven")
+        self.chk_partial.setStyleSheet(f"color:{C['txt2']};font-size:10px;")
+        self.chk_partial.stateChanged.connect(self._toggle_partial_close)
+        ict_row1.addWidget(self.chk_partial)
+        ict_layout.addLayout(ict_row1)
+
+        # Manual FVG scan button
+        btn_fvg_scan = QPushButton("🔍 Scan FVGs now")
+        btn_fvg_scan.setMinimumHeight(26)
+        btn_fvg_scan.setStyleSheet(
+            f"background:{C['card']};color:{C['cyan']};font-size:10px;"
+            f"border:1px solid {C['border_hi']};border-radius:4px;")
+        btn_fvg_scan.clicked.connect(self._manual_fvg_scan)
+        ict_layout.addWidget(btn_fvg_scan)
+
+        ol.addWidget(grp_ict)
         vl.addWidget(grp2)
 
         # ── Levels table ─────────────────────────────────────────
@@ -1816,6 +1873,44 @@ class GUI(QMainWindow):
             f"MT5 SL set on {updated} positions {status}", "NEW")
         self.lbl_rf_status.setText(
             f"🛡️ Active: {self._rf_keep_side} | MT5 SL @ {new_price:.5f}")
+
+    def _toggle_fvg_tp(self, state):
+        cw = getattr(self, "_worker", None)
+        if cw:
+            cw.ict_use_fvg_tp = bool(state)
+
+    def _toggle_partial_close(self, state):
+        cw = getattr(self, "_worker", None)
+        if cw:
+            cw.ict_partial_close = bool(state)
+
+    def _manual_fvg_scan(self):
+        cw = getattr(self, "_worker", None)
+        if cw:
+            cw._detect_fvg()
+            self._on_log(
+                f"{datetime.now().strftime('%H:%M:%S')}  🔍 Manual FVG scan triggered", "INFO")
+        else:
+            self._on_log(
+                f"{datetime.now().strftime('%H:%M:%S')}  ⚠️  Start watcher first", "WARN")
+
+    def _update_fvg_display(self, zones: list):
+        """Update the FVG panel labels from detected zones."""
+        bullish = [z for z in zones if z["type"] == "bullish"]
+        bearish = [z for z in zones if z["type"] == "bearish"]
+        self.lbl_fvg.setText(
+            f"FVG active: {len(bullish)} 🟢 bullish  {len(bearish)} 🔴 bearish")
+
+        lines = []
+        # Show nearest 3 of each type
+        for z in sorted(bearish, key=lambda x: x["top"], reverse=True)[:3]:
+            lines.append(
+                f"🔴 {z['bottom']:.5f} – {z['top']:.5f}  mid={z['mid']:.5f}")
+        for z in sorted(bullish, key=lambda x: x["bottom"])[:3]:
+            lines.append(
+                f"🟢 {z['bottom']:.5f} – {z['top']:.5f}  mid={z['mid']:.5f}")
+        self.lbl_fvg_zones.setText(
+            "\n".join(lines) if lines else "No FVGs detected")
 
     def _apply_tp(self):
         """
@@ -2882,6 +2977,18 @@ class GUI(QMainWindow):
             return
         if msg == "__REFRESH_ORDERS__":
             self._refresh_orders_tab()
+            return
+        # ── ICT FVG update (silent — doesn't print to log) ───────
+        if msg.startswith("__FVG_UPDATE__"):
+            try:
+                parts = msg.split("|")
+                summary = parts[1] if len(parts) > 1 else ""
+                zones_repr = parts[2] if len(parts) > 2 else "[]"
+                zones = eval(zones_repr)
+                self.lbl_fvg.setText(summary)
+                self._update_fvg_display(zones)
+            except Exception:
+                pass
             return
         if msg.startswith("__CANDLE__"):
             try:

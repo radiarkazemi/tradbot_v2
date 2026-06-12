@@ -49,6 +49,12 @@ class WatcherWorker(threading.Thread):
         self._last_prev_t = 0
         # exposed to GUI
         self.source_registry = {}
+        # ── ICT / FVG ─────────────────────────────────────────────
+        self.candle_buffer: list = []   # rolling M1 candle history
+        self.fvg_zones: list = []   # active unfilled FVG zones
+        self.ict_use_fvg_tp: bool = True  # use nearest FVG as TP
+        self.ict_partial_close: bool = True  # partial close at G1-L3
+        self._fvg_logged: set = set()  # zones already signalled (prevents repeat logs)
 
     def stop(self): self._stop.set()
 
@@ -77,6 +83,387 @@ class WatcherWorker(threading.Thread):
         return step
 
     # ── Order placement ───────────────────────────────────────────
+
+    # ══════════════════════════════════════════════════════════════
+    #  ICT — Fair Value Gap Detection & ICT Exits
+    # ══════════════════════════════════════════════════════════════
+
+    def _fvg_alignment(self, src: float, direction: str, pip: float) -> dict | None:
+        """
+        Check if an FVG aligns with the trade direction within TP range.
+        Returns the nearest confirming FVG dict or None.
+        Used at touch detection to grade entry quality.
+        """
+        if not self.fvg_zones:
+            return None
+        is_sell = "SELL" in direction
+        tp_range = self.tp_pips * pip * 2   # search within 2× TP distance
+        for z in sorted(
+                self.fvg_zones,
+                key=lambda x: abs(x["mid"] - src)):
+            if is_sell and z["type"] == "bearish" and z["mid"] < src:
+                if src - z["mid"] <= tp_range:
+                    return z
+            elif not is_sell and z["type"] == "bullish" and z["mid"] > src:
+                if z["mid"] - src <= tp_range:
+                    return z
+        return None
+
+    def _apply_fvg_tps_on_orders(self):
+        """
+        After order placement, update TPs on ALL bot pending orders AND
+        open positions to the nearest FVG midpoint in the trade direction.
+        Pending orders use TRADE_ACTION_MODIFY.
+        Open positions use TRADE_ACTION_SLTP.
+        """
+        if not self.ict_use_fvg_tp or not self.fvg_zones:
+            return
+
+        mod_orders = 0
+        # ── Pending orders ────────────────────────────────────────
+        pending = mt5.orders_get(symbol=self.symbol) or []
+        for o in pending:
+            if o.magic != MAGIC_NUMBER:
+                continue
+            direction = "BUY" if o.type == 4 else "SELL"
+            ftp = self._fvg_tp(direction, o.price_open, o.tp)
+            if ftp == o.tp or ftp <= 0:
+                continue
+            res = mt5.order_send({
+                "action":    mt5.TRADE_ACTION_MODIFY,
+                "order":     o.ticket,
+                "price":     o.price_open,
+                "sl":        o.sl,
+                "tp":        ftp,
+                "type_time": mt5.ORDER_TIME_GTC,
+            })
+            if res and res.retcode == mt5.TRADE_RETCODE_DONE:
+                mod_orders += 1
+
+        # ── Open positions ────────────────────────────────────────
+        mod_pos = 0
+        positions = mt5.positions_get(symbol=self.symbol) or []
+        for p in positions:
+            if p.magic != MAGIC_NUMBER:
+                continue
+            direction = "BUY" if p.type == 0 else "SELL"
+            ftp = self._fvg_tp(direction, p.price_open, p.tp)
+            if ftp == p.tp or ftp <= 0:
+                continue
+            res = mt5.order_send({
+                "action":   mt5.TRADE_ACTION_SLTP,
+                "symbol":   self.symbol,
+                "position": p.ticket,
+                "sl":       p.sl,
+                "tp":       ftp,
+            })
+            if res and res.retcode == mt5.TRADE_RETCODE_DONE:
+                mod_pos += 1
+
+        if mod_orders + mod_pos > 0:
+            self.log(
+                f"🎯 FVG TP applied: {mod_orders} pending orders + "
+                f"{mod_pos} positions → nearest FVG midpoint", "NEW")
+
+    def _check_fvg_fill_exit(self, bid: float):
+        """
+        Log once when price enters an FVG zone.
+        No auto-close — FVGs are visual signals only.
+        Uses _fvg_logged set so the same zone never fires twice,
+        even after _detect_fvg() rebuilds the zones list.
+        """
+        if not self.fvg_zones:
+            return
+        # Only signal if the bot actually has open positions to act on
+        positions = mt5.positions_get(symbol=self.symbol) or []
+        bot_positions = [p for p in positions if p.magic == MAGIC_NUMBER]
+        if not bot_positions:
+            return
+        for z in self.fvg_zones:
+            if not (z["bottom"] <= bid <= z["top"]):
+                continue
+            key = f"{z['type']}_{z['top']:.5f}_{z['bottom']:.5f}"
+            if key in self._fvg_logged:
+                continue
+            zone_dir = z["type"]
+            suggest = "SELL" if zone_dir == "bearish" else "BUY"
+            pos_type = 1 if suggest == "SELL" else 0   # MT5 type: 0=BUY, 1=SELL
+            positions = mt5.positions_get(symbol=self.symbol) or []
+            has_pos = any(
+                p.magic == MAGIC_NUMBER and p.type == pos_type
+                for p in positions)
+            if not has_pos:
+                continue   # no relevant positions — skip the log
+            self._fvg_logged.add(key)
+            self.log(
+                f"📐 FVG {zone_dir} entered @ {bid:.5f} "
+                f"({z['bottom']:.5f}–{z['top']:.5f} mid={z['mid']:.5f}) "
+                f"— consider closing {suggest} positions", "NEW")
+
+    def _load_historical_candles(self, count: int = 120):
+        """
+        Load the last N closed M1 candles directly from MT5 on startup.
+        This fills the candle buffer immediately so FVG detection works
+        from the first scan without waiting for live candles to accumulate.
+        """
+        try:
+            rates = mt5.copy_rates_from_pos(
+                self.symbol, mt5.TIMEFRAME_M1, 1, count)
+            if rates is None or len(rates) == 0:
+                self.log(
+                    "⚠️  Historical candles unavailable — FVG will build over time", "WARN")
+                return
+            self.candle_buffer = []
+            for r in rates:
+                c = {
+                    "t":     int(r["time"]),
+                    "open":  float(r["open"]),
+                    "high":  float(r["high"]),
+                    "low":   float(r["low"]),
+                    "close": float(r["close"]),
+                }
+                if c["high"] > 0:
+                    self.candle_buffer.append(c)
+            self.candle_buffer.sort(key=lambda x: x["t"])
+            if len(self.candle_buffer) > 120:
+                self.candle_buffer = self.candle_buffer[-120:]
+            self.log(
+                f"📊  Loaded {len(self.candle_buffer)} M1 candles from MT5 "
+                f"— running FVG scan…", "NEW")
+            self._detect_fvg()
+        except Exception as e:
+            self.log(f"⚠️  Historical candle load failed: {e}", "WARN")
+
+    def _update_candle_buffer(self, candle: dict):
+        """Add latest closed candle to rolling buffer (called each scan)."""
+        prev_t = candle.get("PREV_T", 0)
+        if not prev_t:
+            return
+        if self.candle_buffer and self.candle_buffer[-1]["t"] == prev_t:
+            return  # same candle, no update needed
+        c = {
+            "t":     prev_t,
+            "open":  candle.get("PREV_O", 0.0),
+            "high":  candle.get("PREV_H", 0.0),
+            "low":   candle.get("PREV_L", 0.0),
+            "close": candle.get("PREV_C", 0.0),
+        }
+        if c["high"] <= 0:
+            return
+        self.candle_buffer.append(c)
+        if len(self.candle_buffer) > 120:      # keep 2 hours of M1 data
+            self.candle_buffer.pop(0)
+
+    def _detect_fvg(self):
+        """
+        Scan candle buffer for Fair Value Gaps (3-candle imbalance).
+
+        Bullish FVG : C1.high < C3.low  → gap = (C1.high , C3.low)
+        Bearish FVG : C1.low  > C3.high → gap = (C3.high , C1.low)
+
+        Only keeps unfilled gaps (price hasn't re-entered the zone).
+        Stores results in self.fvg_zones.
+        """
+        if len(self.candle_buffer) < 3:
+            return
+
+        # current mid-price for fill check
+        try:
+            tick = mt5.symbol_info_tick(self.symbol)
+            cur = (tick.bid + tick.ask) / 2 if tick else 0.0
+        except Exception:
+            cur = 0.0
+
+        zones = []
+        buf = self.candle_buffer[-50:]          # scan last 50 candles only
+        for i in range(1, len(buf) - 1):
+            c1, c3 = buf[i - 1], buf[i + 1]
+            if c1["high"] <= 0 or c3["high"] <= 0:
+                continue
+
+            # Bullish FVG
+            if c1["high"] < c3["low"]:
+                bottom = c1["high"]
+                top = c3["low"]
+                mid = (top + bottom) / 2
+                filled = cur > 0 and bottom <= cur <= top
+                if not filled:
+                    zones.append({
+                        "type": "bullish", "top": top, "bottom": bottom,
+                        "mid": mid, "time": c3["t"], "filled": False})
+
+            # Bearish FVG
+            elif c1["low"] > c3["high"]:
+                top = c1["low"]
+                bottom = c3["high"]
+                mid = (top + bottom) / 2
+                filled = cur > 0 and bottom <= cur <= top
+                if not filled:
+                    zones.append({
+                        "type": "bearish", "top": top, "bottom": bottom,
+                        "mid": mid, "time": c3["t"], "filled": False})
+
+        self.fvg_zones = zones
+
+        # Prune _fvg_logged: remove keys for zones no longer detected
+        # (they may reappear later as fresh zones and should log again)
+        active_keys = {
+            f"{z['type']}_{z['top']:.5f}_{z['bottom']:.5f}"
+            for z in zones}
+        self._fvg_logged &= active_keys   # keep only still-active ones
+
+        # ── Draw FVG zones on MT5 chart ───────────────────────────
+        # Clear old FVG drawings, then draw new ones as horizontal lines
+        cmds = ["DELETE_PREFIX|TB_FVG_"]
+        for i, z in enumerate(zones[:12]):          # max 12 zones on chart
+            t = z["type"]
+            if t == "bullish":
+                c_top = 32768       # dark green top border
+                c_mid = 65280       # bright green midpoint
+                c_bot = 32768       # dark green bottom border
+            else:
+                c_top = 8388608     # dark red top border
+                c_mid = 16711680    # bright red midpoint
+                c_bot = 8388608     # dark red bottom border
+            pfx = f"TB_FVG_{t[:4].upper()}_{i}"
+            cmds += [
+                # dashed top
+                f"DRAW_HLINE|{pfx}_T|{z['top']:.5f}|{c_top}|1|1",
+                # solid mid (target)
+                f"DRAW_HLINE|{pfx}_M|{z['mid']:.5f}|{c_mid}|2|0",
+                # dashed bottom
+                f"DRAW_HLINE|{pfx}_B|{z['bottom']:.5f}|{c_bot}|1|1",
+            ]
+        write_commands(cmds, symbol=self.symbol)
+
+        # ── Emit to GUI panel ─────────────────────────────────────
+        summary = (
+            f"📐 FVG: {sum(1 for z in zones if z['type'] == 'bullish')} bullish  "
+            f"{sum(1 for z in zones if z['type'] == 'bearish')} bearish"
+        )
+        self.sig.log_line.emit(f"__FVG_UPDATE__|{summary}|{zones!r}", "FVG")
+
+    def _fvg_tp(self, direction: str, entry: float, fallback: float) -> float:
+        """
+        Return nearest FVG midpoint as TP target.
+        SELL → nearest bearish FVG below entry.
+        BUY  → nearest bullish FVG above entry.
+        Falls back to fallback if no suitable FVG exists.
+        """
+        if not self.ict_use_fvg_tp or not self.fvg_zones:
+            return fallback
+        is_sell = "SELL" in direction
+        candidates = []
+        for z in self.fvg_zones:
+            if is_sell and z["type"] == "bearish" and z["mid"] < entry:
+                candidates.append(z["mid"])
+            elif not is_sell and z["type"] == "bullish" and z["mid"] > entry:
+                candidates.append(z["mid"])
+        if not candidates:
+            return fallback
+        # nearest: highest bearish below for SELL, lowest bullish above for BUY
+        return max(candidates) if is_sell else min(candidates)
+
+    def _apply_fvg_tps(self):
+        """
+        After a spawn, update all open positions' TP to the nearest FVG target.
+        Only updates if FVG TP is more favourable than existing TP.
+        """
+        if not self.ict_use_fvg_tp:
+            return
+        positions = mt5.positions_get(symbol=self.symbol) or []
+        updated = 0
+        for p in positions:
+            if p.magic != MAGIC_NUMBER:
+                continue
+            direction = "BUY" if p.type == 0 else "SELL"
+            fvg_tp = self._fvg_tp(direction, p.price_open, p.tp)
+            if fvg_tp == p.tp or fvg_tp <= 0:
+                continue
+            # Only tighten TP if it's closer (more conservative exit)
+            if direction == "BUY" and fvg_tp < p.price_open:
+                continue
+            if direction == "SELL" and fvg_tp > p.price_open:
+                continue
+            res = mt5.order_send({
+                "action":   mt5.TRADE_ACTION_SLTP,
+                "symbol":   self.symbol,
+                "position": p.ticket,
+                "sl":       p.sl,
+                "tp":       fvg_tp,
+            })
+            if res and res.retcode == mt5.TRADE_RETCODE_DONE:
+                updated += 1
+        if updated:
+            self.log(
+                f"🎯 ICT: Updated TP on {updated} positions to nearest FVG", "NEW")
+
+    def _ict_partial_close(self):
+        """
+        Called when G1-L3 activates.
+        Closes 50% of profitable positions (oldest first) and locks gains.
+        Moves remaining SLs to breakeven.
+        """
+        if not self.ict_partial_close:
+            return
+        positions = mt5.positions_get(symbol=self.symbol) or []
+        bot_pos = sorted(
+            [p for p in positions if p.magic == MAGIC_NUMBER],
+            key=lambda p: p.time)  # oldest first
+
+        profitable = [p for p in bot_pos if p.profit > 0]
+        if not profitable:
+            self.log("ℹ️  ICT partial close: no profitable positions to close")
+            return
+
+        close_n = max(1, len(profitable) // 2)   # 50%
+        to_close = profitable[:close_n]
+        closed = 0
+        locked_pnl = 0.0
+
+        for p in to_close:
+            close_type = mt5.ORDER_TYPE_SELL if p.type == 0 else mt5.ORDER_TYPE_BUY
+            tick = mt5.symbol_info_tick(self.symbol)
+            price = tick.bid if close_type == mt5.ORDER_TYPE_SELL else tick.ask
+            for fill in (mt5.ORDER_FILLING_FOK, mt5.ORDER_FILLING_IOC,
+                         mt5.ORDER_FILLING_RETURN):
+                req = {
+                    "action":       mt5.TRADE_ACTION_DEAL,
+                    "symbol":       self.symbol,
+                    "volume":       p.volume,
+                    "type":         close_type,
+                    "position":     p.ticket,
+                    "price":        price,
+                    "deviation":    30,
+                    "magic":        MAGIC_NUMBER,
+                    "comment":      "TB_ICT_PARTIAL",
+                    "type_time":    mt5.ORDER_TIME_GTC,
+                    "type_filling": fill,
+                }
+                res = mt5.order_send(req)
+                if res and res.retcode == mt5.TRADE_RETCODE_DONE:
+                    closed += 1
+                    locked_pnl += p.profit
+                    break
+
+        # Move remaining profitable positions' SL to breakeven
+        be_moved = 0
+        remaining = [p for p in profitable if p not in to_close]
+        for p in remaining:
+            res = mt5.order_send({
+                "action":   mt5.TRADE_ACTION_SLTP,
+                "symbol":   self.symbol,
+                "position": p.ticket,
+                "sl":       p.price_open,   # breakeven
+                "tp":       p.tp,
+            })
+            if res and res.retcode == mt5.TRADE_RETCODE_DONE:
+                be_moved += 1
+
+        self.log(
+            f"💰 ICT G1-L3 partial close: locked ${locked_pnl:.2f} | "
+            f"closed {closed}/{len(profitable)} profitable | "
+            f"moved {be_moved} SLs to breakeven", "NEW")
 
     def _place_orders_for_source(self, source_price: float, pip_size: float, generation: int = 0):
         # ── Ensure MT5 is initialized and logged in ───────────────
@@ -220,6 +607,9 @@ class WatcherWorker(threading.Thread):
                             reg["price_was_away"] = True  # already away
                             self.log(
                                 f"   ↩️  G1-L3 hit — pullback re-armed on main source @ {reg['src']:.5f}")
+                            # ── ICT exits ────────────────────────────────────
+                            self._ict_partial_close()   # lock 50% of profits
+                            self._apply_fvg_tps()       # snap TPs to FVG zones
 
             del self.pending_tracker[ticket]
 
@@ -275,6 +665,7 @@ class WatcherWorker(threading.Thread):
             self._draw_hline_levels(
                 f"TB_SPAWN_G{new_gen}_R{self.spawn_rounds}", entry, pip)
             self._place_orders_for_source(entry, pip, generation=new_gen)
+            self._apply_fvg_tps_on_orders()   # snap all TPs to FVG
             self._log_position_map()
             break
 
@@ -404,6 +795,9 @@ class WatcherWorker(threading.Thread):
         source_registry = {}
         self.source_registry = source_registry
 
+        # Load historical M1 candles for immediate FVG analysis
+        self._load_historical_candles(120)
+
         import os as _os
         import time as _time
 
@@ -501,6 +895,15 @@ class WatcherWorker(threading.Thread):
                 cur_o = candle.get("CANDLE_O", current_price)
                 prev_h = candle.get("PREV_H", 0.0)
                 prev_l = candle.get("PREV_L", 0.0)
+
+                # ── ICT: update candle buffer + detect FVGs ───────
+                self._update_candle_buffer(candle)
+                self._detect_fvg()   # runs every new M1 candle
+
+                # ── ICT: FVG fill exit check ───────────────────────
+                bid = candle.get("BID", 0.0)
+                if bid > 0:
+                    self._check_fvg_fill_exit(bid)
                 prev_c = candle.get("PREV_C", 0.0)
                 prev_o = candle.get("PREV_O", 0.0)
                 self._last_prev_t = candle.get("PREV_T", 0)
@@ -606,8 +1009,20 @@ class WatcherWorker(threading.Thread):
                         icon = "🟢" if direction == "BUY" else "🔴"
                         self.log(f"🎯  [{n[:20]}] touched @ {src:.5f} {side} | "
                                  f"C={touch_c:.5f} → {icon} {direction} bias | placing orders", "NEW")
+                        # ── ICT entry confirmation ────────────────
+                        fvg_conf = self._fvg_alignment(src, direction, pip)
+                        if fvg_conf:
+                            self.log(
+                                f"   ✅ FVG aligned: {fvg_conf['type']} "
+                                f"{fvg_conf['bottom']:.5f}–{fvg_conf['top']:.5f}  "
+                                f"mid={fvg_conf['mid']:.5f} — HIGH PROB entry", "NEW")
+                        else:
+                            self.log(
+                                f"   ⚠️  No FVG alignment in TP range — "
+                                f"lower probability entry", "WARN")
                         self._place_orders_for_source(
                             src, pip, generation=reg["gen"])
+                        self._apply_fvg_tps_on_orders()  # snap TPs to FVG
 
                 # ── Phase 3 ──────────────────────────────────────
                 self._check_phase3_activations(pip)
